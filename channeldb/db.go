@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec"
@@ -39,56 +38,16 @@ var (
 	// current db.
 	dbVersions = []version{
 		{
-			// The base DB version requires no migration.
-			number:    0,
-			migration: nil,
+			// The DB version where we started to store legacy
+			// payload information for all routes, as well as the
+			// optional TLV records.
+			number:    10,
+			migration: migrateRouteSerialization,
 		},
 		{
-			// The version of the database where two new indexes
-			// for the update time of node and channel updates were
-			// added.
-			number:    1,
-			migration: migrateNodeAndEdgeUpdateIndex,
-		},
-		{
-			// The DB version that added the invoice event time
-			// series.
-			number:    2,
-			migration: migrateInvoiceTimeSeries,
-		},
-		{
-			// The DB version that updated the embedded invoice in
-			// outgoing payments to match the new format.
-			number:    3,
-			migration: migrateInvoiceTimeSeriesOutgoingPayments,
-		},
-		{
-			// The version of the database where every channel
-			// always has two entries in the edges bucket. If
-			// a policy is unknown, this will be represented
-			// by a special byte sequence.
-			number:    4,
-			migration: migrateEdgePolicies,
-		},
-		{
-			// The DB version where we persist each attempt to send
-			// an HTLC to a payment hash, and track whether the
-			// payment is in-flight, succeeded, or failed.
-			number:    5,
-			migration: paymentStatusesMigration,
-		},
-		{
-			// The DB version that properly prunes stale entries
-			// from the edge update index.
-			number:    6,
-			migration: migratePruneEdgeUpdateIndex,
-		},
-		{
-			// The DB version that migrates the ChannelCloseSummary
-			// to a format where optional fields are indicated with
-			// boolean flags.
-			number:    7,
-			migration: migrateOptionalChannelCloseSummaryFields,
+			// Add invoice htlc and cltv delta fields.
+			number:    11,
+			migration: migrateInvoices,
 		},
 	}
 
@@ -97,21 +56,19 @@ var (
 	byteOrder = binary.BigEndian
 )
 
-var bufPool = &sync.Pool{
-	New: func() interface{} { return new(bytes.Buffer) },
-}
-
 // DB is the primary datastore for the lnd daemon. The database stores
 // information related to nodes, routing data, open/closed channels, fee
 // schedules, and reputation data.
 type DB struct {
 	*bbolt.DB
 	dbPath string
+	graph  *ChannelGraph
+	now    func() time.Time
 }
 
 // Open opens an existing channeldb. Any necessary schemas migrations due to
 // updates will take place as necessary.
-func Open(dbPath string) (*DB, error) {
+func Open(dbPath string, modifiers ...OptionModifier) (*DB, error) {
 	path := filepath.Join(dbPath, dbName)
 
 	if !fileExists(path) {
@@ -120,7 +77,19 @@ func Open(dbPath string) (*DB, error) {
 		}
 	}
 
-	bdb, err := bbolt.Open(path, dbFilePermission, nil)
+	opts := DefaultOptions()
+	for _, modifier := range modifiers {
+		modifier(&opts)
+	}
+
+	// Specify bbolt freelist options to reduce heap pressure in case the
+	// freelist grows to be very large.
+	options := &bbolt.Options{
+		NoFreelistSync: opts.NoFreelistSync,
+		FreelistType:   bbolt.FreelistMapType,
+	}
+
+	bdb, err := bbolt.Open(path, dbFilePermission, options)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +97,11 @@ func Open(dbPath string) (*DB, error) {
 	chanDB := &DB{
 		DB:     bdb,
 		dbPath: dbPath,
+		now:    time.Now,
 	}
+	chanDB.graph = newChannelGraph(
+		chanDB, opts.RejectCacheSize, opts.ChannelCacheSize,
+	)
 
 	// Synchronize the version of database and apply migrations if needed.
 	if err := chanDB.syncVersions(dbVersions); err != nil {
@@ -227,10 +200,6 @@ func createChannelDB(dbPath string) error {
 			return err
 		}
 
-		if _, err := tx.CreateBucket(paymentBucket); err != nil {
-			return err
-		}
-
 		if _, err := tx.CreateBucket(nodeInfoBucket); err != nil {
 			return err
 		}
@@ -259,6 +228,9 @@ func createChannelDB(dbPath string) error {
 			return err
 		}
 		if _, err := edges.CreateBucket(channelPointBucket); err != nil {
+			return err
+		}
+		if _, err := edges.CreateBucket(zombieBucket); err != nil {
 			return err
 		}
 
@@ -890,11 +862,22 @@ type ChannelShell struct {
 // well. This method is idempotent, so repeated calls with the same set of
 // channel shells won't modify the database after the initial call.
 func (d *DB) RestoreChannelShells(channelShells ...*ChannelShell) error {
-	chanGraph := ChannelGraph{d}
+	chanGraph := d.ChannelGraph()
 
-	return d.Update(func(tx *bbolt.Tx) error {
+	// TODO(conner): find way to do this w/o accessing internal members?
+	chanGraph.cacheMu.Lock()
+	defer chanGraph.cacheMu.Unlock()
+
+	var chansRestored []uint64
+	err := d.Update(func(tx *bbolt.Tx) error {
 		for _, channelShell := range channelShells {
 			channel := channelShell.Chan
+
+			// When we make a channel, we mark that the channel has
+			// been restored, this will signal to other sub-systems
+			// to not attempt to use the channel as if it was a
+			// regular one.
+			channel.chanStatus |= ChanStatusRestored
 
 			// First, we'll attempt to create a new open channel
 			// and link node for this channel. If the channel
@@ -920,6 +903,7 @@ func (d *DB) RestoreChannelShells(channelShells ...*ChannelShell) error {
 				ChannelID:    channel.ShortChannelID.ToUint64(),
 				ChainHash:    channel.ChainHash,
 				ChannelPoint: channel.FundingOutpoint,
+				Capacity:     channel.Capacity,
 			}
 
 			nodes := tx.Bucket(nodeBucket)
@@ -948,7 +932,7 @@ func (d *DB) RestoreChannelShells(channelShells ...*ChannelShell) error {
 			// With the edge info shell constructed, we'll now add
 			// it to the graph.
 			err = chanGraph.addChannelEdge(tx, &edgeInfo)
-			if err != nil {
+			if err != nil && err != ErrEdgeAlreadyExist {
 				return err
 			}
 
@@ -966,14 +950,26 @@ func (d *DB) RestoreChannelShells(channelShells ...*ChannelShell) error {
 				chanEdge.ChannelFlags |= lnwire.ChanUpdateDirection
 			}
 
-			err = updateEdgePolicy(tx, &chanEdge)
+			_, err = updateEdgePolicy(tx, &chanEdge)
 			if err != nil {
 				return err
 			}
+
+			chansRestored = append(chansRestored, edgeInfo.ChannelID)
 		}
 
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	for _, chanid := range chansRestored {
+		chanGraph.rejectCache.remove(chanid)
+		chanGraph.chanCache.remove(chanid)
+	}
+
+	return nil
 }
 
 // AddrsForNode consults the graph and channel database for all addresses known
@@ -1001,7 +997,9 @@ func (d *DB) AddrsForNode(nodePub *btcec.PublicKey) ([]net.Addr, error) {
 		}
 		compressedPubKey := nodePub.SerializeCompressed()
 		graphNode, err = fetchLightningNode(nodes, compressedPubKey)
-		if err != nil {
+		if err != nil && err != ErrGraphNodeNotFound {
+			// If the node isn't found, then that's OK, as we still
+			// have the link node data.
 			return err
 		}
 
@@ -1043,8 +1041,10 @@ func (d *DB) syncVersions(versions []version) error {
 	}
 
 	latestVersion := getLatestDBVersion(versions)
+	minUpgradeVersion := getMinUpgradeVersion(versions)
 	log.Infof("Checking for schema update: latest_version=%v, "+
-		"db_version=%v", latestVersion, meta.DbVersionNumber)
+		"min_upgrade_version=%v, db_version=%v", latestVersion,
+		minUpgradeVersion, meta.DbVersionNumber)
 
 	switch {
 
@@ -1056,6 +1056,12 @@ func (d *DB) syncVersions(versions []version) error {
 			"lower version=%d", meta.DbVersionNumber,
 			latestVersion)
 		return ErrDBReversion
+
+	case meta.DbVersionNumber < minUpgradeVersion:
+		log.Errorf("Refusing to upgrade from db_version=%d to "+
+			"latest_version=%d. Upgrade via intermediate major "+
+			"release(s).", meta.DbVersionNumber, latestVersion)
+		return ErrDBVersionTooLow
 
 	// If the current database version matches the latest version number,
 	// then we don't need to perform any migrations.
@@ -1093,11 +1099,26 @@ func (d *DB) syncVersions(versions []version) error {
 
 // ChannelGraph returns a new instance of the directed channel graph.
 func (d *DB) ChannelGraph() *ChannelGraph {
-	return &ChannelGraph{d}
+	return d.graph
 }
 
 func getLatestDBVersion(versions []version) uint32 {
 	return versions[len(versions)-1].number
+}
+
+// getMinUpgradeVersion returns the minimum version required to upgrade the
+// database.
+func getMinUpgradeVersion(versions []version) uint32 {
+	firstMigrationVersion := versions[0].number
+
+	// If we can upgrade from the base version with this version of lnd,
+	// return the base version as the minimum required version.
+	if firstMigrationVersion == 0 {
+		return 0
+	}
+
+	// Otherwise require the version that the first migration upgrades from.
+	return firstMigrationVersion - 1
 }
 
 // getMigrationsToApply retrieves the migration function that should be

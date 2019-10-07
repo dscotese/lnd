@@ -2,16 +2,14 @@ package contractcourt
 
 import (
 	"encoding/binary"
-	"fmt"
-	"github.com/lightningnetwork/lnd/input"
 	"io"
-
-	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/lnwire"
 
 	"github.com/btcsuite/btcd/wire"
 	"github.com/davecgh/go-spew/spew"
+	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/sweep"
 )
 
@@ -41,7 +39,7 @@ type htlcSuccessResolver struct {
 	broadcastHeight uint32
 
 	// payHash is the payment hash of the original HTLC extended to us.
-	payHash [32]byte
+	payHash lntypes.Hash
 
 	// sweepTx will be non-nil if we've already crafted a transaction to
 	// sweep a direct HTLC output. This is only a concern if we're sweeping
@@ -78,9 +76,11 @@ func (h *htlcSuccessResolver) ResolverKey() []byte {
 }
 
 // Resolve attempts to resolve an unresolved incoming HTLC that we know the
-// preimage to. If the HTLC is on the commitment of the remote party, then
-// we'll simply sweep it directly. Otherwise, we'll hand this off to the utxo
-// nursery to do its duty.
+// preimage to. If the HTLC is on the commitment of the remote party, then we'll
+// simply sweep it directly. Otherwise, we'll hand this off to the utxo nursery
+// to do its duty. There is no need to make a call to the invoice registry
+// anymore. Every HTLC has already passed through the incoming contest resolver
+// and in there the invoice was already marked as settled.
 //
 // TODO(roasbeef): create multi to batch
 //
@@ -147,7 +147,7 @@ func (h *htlcSuccessResolver) Resolve() (ContractResolver, error) {
 		// constructed, we'll broadcast the sweep transaction to the
 		// network.
 		err := h.PublishTx(h.sweepTx)
-		if err != nil && err != lnwallet.ErrDoubleSpend {
+		if err != nil {
 			log.Infof("%T(%x): unable to publish tx: %v",
 				h, h.payHash[:], err)
 			return nil, err
@@ -170,19 +170,11 @@ func (h *htlcSuccessResolver) Resolve() (ContractResolver, error) {
 		select {
 		case _, ok := <-confNtfn.Confirmed:
 			if !ok {
-				return nil, fmt.Errorf("quitting")
+				return nil, errResolverShuttingDown
 			}
 
 		case <-h.Quit:
-			return nil, fmt.Errorf("quitting")
-		}
-
-		// With the HTLC claimed, we can attempt to settle its
-		// corresponding invoice if we were the original destination.
-		err = h.SettleInvoice(h.payHash, h.htlcAmt)
-		if err != nil && err != channeldb.ErrInvoiceNotFound {
-			log.Errorf("Unable to settle invoice with payment "+
-				"hash %x: %v", h.payHash, err)
+			return nil, errResolverShuttingDown
 		}
 
 		// Once the transaction has received a sufficient number of
@@ -199,7 +191,7 @@ func (h *htlcSuccessResolver) Resolve() (ContractResolver, error) {
 	//
 	// TODO(roasbeef): after changing sighashes send to tx bundler
 	err := h.PublishTx(h.htlcResolution.SignedSuccessTx)
-	if err != nil && err != lnwallet.ErrDoubleSpend {
+	if err != nil {
 		return nil, err
 	}
 
@@ -243,19 +235,11 @@ func (h *htlcSuccessResolver) Resolve() (ContractResolver, error) {
 	select {
 	case _, ok := <-spendNtfn.Spend:
 		if !ok {
-			return nil, fmt.Errorf("quitting")
+			return nil, errResolverShuttingDown
 		}
 
 	case <-h.Quit:
-		return nil, fmt.Errorf("quitting")
-	}
-
-	// With the HTLC claimed, we can attempt to settle its corresponding
-	// invoice if we were the original destination.
-	err = h.SettleInvoice(h.payHash, h.htlcAmt)
-	if err != nil && err != channeldb.ErrInvoiceNotFound {
-		log.Errorf("Unable to settle invoice with payment "+
-			"hash %x: %v", h.payHash, err)
+		return nil, errResolverShuttingDown
 	}
 
 	h.resolved = true

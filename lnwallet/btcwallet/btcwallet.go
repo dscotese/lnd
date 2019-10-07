@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +16,8 @@ import (
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	base "github.com/btcsuite/btcwallet/wallet"
+	"github.com/btcsuite/btcwallet/wallet/txauthor"
+	"github.com/btcsuite/btcwallet/wallet/txrules"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -57,16 +58,12 @@ type BtcWallet struct {
 	netParams *chaincfg.Params
 
 	chainKeyScope waddrmgr.KeyScope
-
-	// utxoCache is a cache used to speed up repeated calls to
-	// FetchInputInfo.
-	utxoCache map[wire.OutPoint]*wire.TxOut
-	cacheMtx  sync.RWMutex
 }
 
 // A compile time check to ensure that BtcWallet implements the
-// WalletController interface.
+// WalletController and BlockChainIO interfaces.
 var _ lnwallet.WalletController = (*BtcWallet)(nil)
+var _ lnwallet.BlockChainIO = (*BtcWallet)(nil)
 
 // New returns a new fully initialized instance of BtcWallet given a valid
 // configuration struct.
@@ -92,8 +89,10 @@ func New(cfg Config) (*BtcWallet, error) {
 		} else {
 			pubPass = cfg.PublicPass
 		}
-		loader := base.NewLoader(cfg.NetParams, netDir,
-			cfg.RecoveryWindow)
+		loader := base.NewLoader(
+			cfg.NetParams, netDir, cfg.NoFreelistSync,
+			cfg.RecoveryWindow,
+		)
 		walletExists, err := loader.WalletExists()
 		if err != nil {
 			return nil, err
@@ -127,7 +126,6 @@ func New(cfg Config) (*BtcWallet, error) {
 		chain:         cfg.ChainSource,
 		netParams:     cfg.NetParams,
 		chainKeyScope: chainKeyScope,
-		utxoCache:     make(map[wire.OutPoint]*wire.TxOut),
 	}, nil
 }
 
@@ -254,6 +252,29 @@ func (b *BtcWallet) NewAddress(t lnwallet.AddressType, change bool) (btcutil.Add
 	return b.wallet.NewAddress(defaultAccount, keyScope)
 }
 
+// LastUnusedAddress returns the last *unused* address known by the wallet. An
+// address is unused if it hasn't received any payments. This can be useful in
+// UIs in order to continually show the "freshest" address without having to
+// worry about "address inflation" caused by continual refreshing. Similar to
+// NewAddress it can derive a specified address type, and also optionally a
+// change address.
+func (b *BtcWallet) LastUnusedAddress(addrType lnwallet.AddressType) (
+	btcutil.Address, error) {
+
+	var keyScope waddrmgr.KeyScope
+
+	switch addrType {
+	case lnwallet.WitnessPubKey:
+		keyScope = waddrmgr.KeyScopeBIP0084
+	case lnwallet.NestedWitnessPubKey:
+		keyScope = waddrmgr.KeyScopeBIP0049Plus
+	default:
+		return nil, fmt.Errorf("unknown address type")
+	}
+
+	return b.wallet.CurrentAddress(defaultAccount, keyScope)
+}
+
 // IsOurAddress checks if the passed address belongs to this wallet
 //
 // This is a part of the WalletController interface.
@@ -274,7 +295,50 @@ func (b *BtcWallet) SendOutputs(outputs []*wire.TxOut,
 	// SendOutputs.
 	feeSatPerKB := btcutil.Amount(feeRate.FeePerKVByte())
 
+	// Sanity check outputs.
+	if len(outputs) < 1 {
+		return nil, lnwallet.ErrNoOutputs
+	}
 	return b.wallet.SendOutputs(outputs, defaultAccount, 1, feeSatPerKB)
+}
+
+// CreateSimpleTx creates a Bitcoin transaction paying to the specified
+// outputs. The transaction is not broadcasted to the network, but a new change
+// address might be created in the wallet database. In the case the wallet has
+// insufficient funds, or the outputs are non-standard, an error should be
+// returned. This method also takes the target fee expressed in sat/kw that
+// should be used when crafting the transaction.
+//
+// NOTE: The dryRun argument can be set true to create a tx that doesn't alter
+// the database. A tx created with this set to true SHOULD NOT be broadcasted.
+//
+// This is a part of the WalletController interface.
+func (b *BtcWallet) CreateSimpleTx(outputs []*wire.TxOut,
+	feeRate lnwallet.SatPerKWeight, dryRun bool) (*txauthor.AuthoredTx, error) {
+
+	// The fee rate is passed in using units of sat/kw, so we'll convert
+	// this to sat/KB as the CreateSimpleTx method requires this unit.
+	feeSatPerKB := btcutil.Amount(feeRate.FeePerKVByte())
+
+	// Sanity check outputs.
+	if len(outputs) < 1 {
+		return nil, lnwallet.ErrNoOutputs
+	}
+	for _, output := range outputs {
+		// When checking an output for things like dusty-ness, we'll
+		// use the default mempool relay fee rather than the target
+		// effective fee rate to ensure accuracy. Otherwise, we may
+		// mistakenly mark small-ish, but not quite dust output as
+		// dust.
+		err := txrules.CheckOutput(
+			output, txrules.DefaultRelayFeePerKb,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return b.wallet.CreateSimpleTx(defaultAccount, outputs, 1, feeSatPerKB, dryRun)
 }
 
 // LockOutpoint marks an outpoint as locked meaning it will no longer be deemed
@@ -316,7 +380,7 @@ func (b *BtcWallet) ListUnspentWitness(minConfs, maxConfs int32) (
 			return nil, err
 		}
 
-		var addressType lnwallet.AddressType
+		addressType := lnwallet.UnknownAddressType
 		if txscript.IsPayToWitnessPubKeyHash(pkScript) {
 			addressType = lnwallet.WitnessPubKey
 		} else if txscript.IsPayToScriptHash(pkScript) {
@@ -361,90 +425,30 @@ func (b *BtcWallet) ListUnspentWitness(minConfs, maxConfs int32) (
 
 // PublishTransaction performs cursory validation (dust checks, etc), then
 // finally broadcasts the passed transaction to the Bitcoin network. If
-// publishing the transaction fails, an error describing the reason is
-// returned (currently ErrDoubleSpend). If the transaction is already
-// published to the network (either in the mempool or chain) no error
-// will be returned.
+// publishing the transaction fails, an error describing the reason is returned
+// (currently ErrDoubleSpend). If the transaction is already published to the
+// network (either in the mempool or chain) no error will be returned.
 func (b *BtcWallet) PublishTransaction(tx *wire.MsgTx) error {
 	if err := b.wallet.PublishTransaction(tx); err != nil {
-		switch b.chain.(type) {
-		case *chain.RPCClient:
-			if strings.Contains(err.Error(), "already have") {
-				// Transaction was already in the mempool, do
-				// not treat as an error. We do this to mimic
-				// the behaviour of bitcoind, which will not
-				// return an error if a transaction in the
-				// mempool is sent again using the
-				// sendrawtransaction RPC call.
-				return nil
-			}
-			if strings.Contains(err.Error(), "already exists") {
-				// Transaction was already mined, we don't
-				// consider this an error.
-				return nil
-			}
-			if strings.Contains(err.Error(), "already spent") {
-				// Output was already spent.
-				return lnwallet.ErrDoubleSpend
-			}
-			if strings.Contains(err.Error(), "already been spent") {
-				// Output was already spent.
-				return lnwallet.ErrDoubleSpend
-			}
-			if strings.Contains(err.Error(), "orphan transaction") {
-				// Transaction is spending either output that
-				// is missing or already spent.
-				return lnwallet.ErrDoubleSpend
-			}
 
-		case *chain.BitcoindClient:
-			if strings.Contains(err.Error(), "txn-already-in-mempool") {
-				// Transaction in mempool, treat as non-error.
-				return nil
-			}
-			if strings.Contains(err.Error(), "txn-already-known") {
-				// Transaction in mempool, treat as non-error.
-				return nil
-			}
-			if strings.Contains(err.Error(), "already in block") {
-				// Transaction was already mined, we don't
-				// consider this an error.
-				return nil
-			}
-			if strings.Contains(err.Error(), "txn-mempool-conflict") {
-				// Output was spent by other transaction
-				// already in the mempool.
-				return lnwallet.ErrDoubleSpend
-			}
-			if strings.Contains(err.Error(), "insufficient fee") {
-				// RBF enabled transaction did not have enough fee.
-				return lnwallet.ErrDoubleSpend
-			}
-			if strings.Contains(err.Error(), "Missing inputs") {
-				// Transaction is spending either output that
-				// is missing or already spent.
-				return lnwallet.ErrDoubleSpend
-			}
+		// If we failed to publish the transaction, check whether we
+		// got an error of known type.
+		switch err.(type) {
 
-		case *chain.NeutrinoClient:
-			if strings.Contains(err.Error(), "already have") {
-				// Transaction was already in the mempool, do
-				// not treat as an error.
-				return nil
-			}
-			if strings.Contains(err.Error(), "already exists") {
-				// Transaction was already mined, we don't
-				// consider this an error.
-				return nil
-			}
-			if strings.Contains(err.Error(), "already spent") {
-				// Output was already spent.
-				return lnwallet.ErrDoubleSpend
-			}
+		// If the wallet reports a double spend, convert it to our
+		// internal ErrDoubleSpend and return.
+		case *base.ErrDoubleSpend:
+			return lnwallet.ErrDoubleSpend
+
+		// If the wallet reports a replacement error, return
+		// ErrDoubleSpend, as we currently are never attempting to
+		// replace transactions.
+		case *base.ErrReplacement:
+			return lnwallet.ErrDoubleSpend
 
 		default:
+			return err
 		}
-		return err
 	}
 	return nil
 }
@@ -488,8 +492,9 @@ func minedTransactionsToDetails(
 
 		var destAddresses []btcutil.Address
 		for _, txOut := range wireTx.TxOut {
-			_, outAddresses, _, err :=
-				txscript.ExtractPkScriptAddrs(txOut.PkScript, chainParams)
+			_, outAddresses, _, err := txscript.ExtractPkScriptAddrs(
+				txOut.PkScript, chainParams,
+			)
 			if err != nil {
 				return nil, err
 			}
@@ -505,6 +510,7 @@ func minedTransactionsToDetails(
 			Timestamp:        block.Timestamp,
 			TotalFees:        int64(tx.Fee),
 			DestAddresses:    destAddresses,
+			RawTx:            tx.Transaction,
 		}
 
 		balanceDelta, err := extractBalanceDelta(tx, wireTx)
@@ -523,7 +529,9 @@ func minedTransactionsToDetails(
 // for an unconfirmed transaction to a transaction detail.
 func unminedTransactionsToDetail(
 	summary base.TransactionSummary,
+	chainParams *chaincfg.Params,
 ) (*lnwallet.TransactionDetail, error) {
+
 	wireTx := &wire.MsgTx{}
 	txReader := bytes.NewReader(summary.Transaction)
 
@@ -531,10 +539,23 @@ func unminedTransactionsToDetail(
 		return nil, err
 	}
 
+	var destAddresses []btcutil.Address
+	for _, txOut := range wireTx.TxOut {
+		_, outAddresses, _, err :=
+			txscript.ExtractPkScriptAddrs(txOut.PkScript, chainParams)
+		if err != nil {
+			return nil, err
+		}
+
+		destAddresses = append(destAddresses, outAddresses...)
+	}
+
 	txDetail := &lnwallet.TransactionDetail{
-		Hash:      *summary.Hash,
-		TotalFees: int64(summary.Fee),
-		Timestamp: summary.Timestamp,
+		Hash:          *summary.Hash,
+		TotalFees:     int64(summary.Fee),
+		Timestamp:     summary.Timestamp,
+		DestAddresses: destAddresses,
+		RawTx:         summary.Transaction,
 	}
 
 	balanceDelta, err := extractBalanceDelta(summary, wireTx)
@@ -573,7 +594,9 @@ func (b *BtcWallet) ListTransactionDetails() ([]*lnwallet.TransactionDetail, err
 	// TransactionDetail which re-packages the data returned by the base
 	// wallet.
 	for _, blockPackage := range txns.MinedTransactions {
-		details, err := minedTransactionsToDetails(currentHeight, blockPackage, b.netParams)
+		details, err := minedTransactionsToDetails(
+			currentHeight, blockPackage, b.netParams,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -581,7 +604,7 @@ func (b *BtcWallet) ListTransactionDetails() ([]*lnwallet.TransactionDetail, err
 		txDetails = append(txDetails, details...)
 	}
 	for _, tx := range txns.UnminedTransactions {
-		detail, err := unminedTransactionsToDetail(tx)
+		detail, err := unminedTransactionsToDetail(tx, b.netParams)
 		if err != nil {
 			return nil, err
 		}
@@ -668,7 +691,9 @@ out:
 			// notifications for any newly unconfirmed transactions.
 			go func() {
 				for _, tx := range txNtfn.UnminedTransactions {
-					detail, err := unminedTransactionsToDetail(tx)
+					detail, err := unminedTransactionsToDetail(
+						tx, t.w.ChainParams(),
+					)
 					if err != nil {
 						continue
 					}
@@ -710,8 +735,8 @@ func (b *BtcWallet) SubscribeTransactions() (lnwallet.TransactionSubscription, e
 	return txClient, nil
 }
 
-// IsSynced returns a boolean indicating if from the PoV of the wallet,
-// it has fully synced to the current best block in the main chain.
+// IsSynced returns a boolean indicating if from the PoV of the wallet, it has
+// fully synced to the current best block in the main chain.
 //
 // This is a part of the WalletController interface.
 func (b *BtcWallet) IsSynced() (bool, int64, error) {

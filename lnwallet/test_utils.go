@@ -3,13 +3,13 @@ package lnwallet
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"io"
 	"io/ioutil"
+	prand "math/rand"
+	"net"
 	"os"
-	"sync"
 
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -23,8 +23,6 @@ import (
 )
 
 var (
-	privPass = []byte("private-test")
-
 	// For simplicity a single priv key controls all of our test outputs.
 	testWalletPrivKey = []byte{
 		0x2b, 0xd8, 0x06, 0xc9, 0x7f, 0x0e, 0x00, 0xaf,
@@ -48,10 +46,6 @@ var (
 		0x4f, 0x2f, 0x6f, 0x25, 0x88, 0xa3, 0xef, 0xb9,
 		0x6a, 0x49, 0x18, 0x83, 0x31, 0x98, 0x47, 0x53,
 	}
-
-	// The number of confirmations required to consider any created channel
-	// open.
-	numReqConfs = uint16(1)
 
 	// A serializable txn for testing funding txn.
 	testTx = &wire.MsgTx{
@@ -94,8 +88,11 @@ var (
 // allocated to each side. Within the channel, Alice is the initiator. The
 // function also returns a "cleanup" function that is meant to be called once
 // the test has been finalized. The clean up function will remote all temporary
-// files created
-func CreateTestChannels() (*LightningChannel, *LightningChannel, func(), error) {
+// files created. If tweaklessCommits is true, then the commits within the
+// channels will use the new format, otherwise the legacy format.
+func CreateTestChannels(tweaklessCommits bool) (
+	*LightningChannel, *LightningChannel, func(), error) {
+
 	channelCapacity, err := btcutil.NewAmount(10)
 	if err != nil {
 		return nil, nil, nil, err
@@ -109,7 +106,7 @@ func CreateTestChannels() (*LightningChannel, *LightningChannel, func(), error) 
 
 	prevOut := &wire.OutPoint{
 		Hash:  chainhash.Hash(testHdSeed),
-		Index: 0,
+		Index: prand.Uint32(),
 	}
 	fundingTxIn := wire.NewTxIn(prevOut, nil, nil)
 
@@ -208,20 +205,29 @@ func CreateTestChannels() (*LightningChannel, *LightningChannel, func(), error) 
 	}
 	aliceCommitPoint := input.ComputeCommitmentPoint(aliceFirstRevoke[:])
 
-	aliceCommitTx, bobCommitTx, err := CreateCommitmentTxns(channelBal,
-		channelBal, &aliceCfg, &bobCfg, aliceCommitPoint, bobCommitPoint,
-		*fundingTxIn)
+	aliceCommitTx, bobCommitTx, err := CreateCommitmentTxns(
+		channelBal, channelBal, &aliceCfg, &bobCfg, aliceCommitPoint,
+		bobCommitPoint, *fundingTxIn, tweaklessCommits,
+	)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
 	alicePath, err := ioutil.TempDir("", "alicedb")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
 	dbAlice, err := channeldb.Open(alicePath)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
 	bobPath, err := ioutil.TempDir("", "bobdb")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
 	dbBob, err := channeldb.Open(bobPath)
 	if err != nil {
 		return nil, nil, nil, err
@@ -268,7 +274,7 @@ func CreateTestChannels() (*LightningChannel, *LightningChannel, func(), error) 
 		IdentityPub:             aliceKeys[0].PubKey(),
 		FundingOutpoint:         *prevOut,
 		ShortChannelID:          shortChanID,
-		ChanType:                channeldb.SingleFunder,
+		ChanType:                channeldb.SingleFunderTweakless,
 		IsInitiator:             true,
 		Capacity:                channelCapacity,
 		RemoteCurrentRevocation: bobCommitPoint,
@@ -286,7 +292,7 @@ func CreateTestChannels() (*LightningChannel, *LightningChannel, func(), error) 
 		IdentityPub:             bobKeys[0].PubKey(),
 		FundingOutpoint:         *prevOut,
 		ShortChannelID:          shortChanID,
-		ChanType:                channeldb.SingleFunder,
+		ChanType:                channeldb.SingleFunderTweakless,
 		IsInitiator:             false,
 		Capacity:                channelCapacity,
 		RemoteCurrentRevocation: aliceCommitPoint,
@@ -298,19 +304,19 @@ func CreateTestChannels() (*LightningChannel, *LightningChannel, func(), error) 
 		Packager:                channeldb.NewChannelPackager(shortChanID),
 	}
 
+	if !tweaklessCommits {
+		aliceChannelState.ChanType = channeldb.SingleFunder
+		bobChannelState.ChanType = channeldb.SingleFunder
+	}
+
 	aliceSigner := &input.MockSigner{Privkeys: aliceKeys}
 	bobSigner := &input.MockSigner{Privkeys: bobKeys}
-
-	pCache := &mockPreimageCache{
-		// hash -> preimage
-		preimageMap: make(map[[32]byte][]byte),
-	}
 
 	// TODO(roasbeef): make mock version of pre-image store
 
 	alicePool := NewSigPool(1, aliceSigner)
 	channelAlice, err := NewLightningChannel(
-		aliceSigner, pCache, aliceChannelState, alicePool,
+		aliceSigner, aliceChannelState, alicePool,
 	)
 	if err != nil {
 		return nil, nil, nil, err
@@ -319,7 +325,7 @@ func CreateTestChannels() (*LightningChannel, *LightningChannel, func(), error) 
 
 	bobPool := NewSigPool(1, bobSigner)
 	channelBob, err := NewLightningChannel(
-		bobSigner, pCache, bobChannelState, bobPool,
+		bobSigner, bobChannelState, bobPool,
 	)
 	if err != nil {
 		return nil, nil, nil, err
@@ -339,10 +345,20 @@ func CreateTestChannels() (*LightningChannel, *LightningChannel, func(), error) 
 		return nil, nil, nil, err
 	}
 
-	if err := channelAlice.channelState.FullSync(); err != nil {
+	addr := &net.TCPAddr{
+		IP:   net.ParseIP("127.0.0.1"),
+		Port: 18556,
+	}
+	if err := channelAlice.channelState.SyncPending(addr, 101); err != nil {
 		return nil, nil, nil, err
 	}
-	if err := channelBob.channelState.FullSync(); err != nil {
+
+	addr = &net.TCPAddr{
+		IP:   net.ParseIP("127.0.0.1"),
+		Port: 18555,
+	}
+
+	if err := channelBob.channelState.SyncPending(addr, 101); err != nil {
 		return nil, nil, nil, err
 	}
 
@@ -387,31 +403,6 @@ func initRevocationWindows(chanA, chanB *LightningChannel) error {
 	return nil
 }
 
-type mockPreimageCache struct {
-	sync.Mutex
-	preimageMap map[[32]byte][]byte
-}
-
-func (m *mockPreimageCache) LookupPreimage(hash []byte) ([]byte, bool) {
-	m.Lock()
-	defer m.Unlock()
-
-	var h [32]byte
-	copy(h[:], hash)
-
-	p, ok := m.preimageMap[h]
-	return p, ok
-}
-
-func (m *mockPreimageCache) AddPreimage(preimage []byte) error {
-	m.Lock()
-	defer m.Unlock()
-
-	m.preimageMap[sha256.Sum256(preimage[:])] = preimage
-
-	return nil
-}
-
 // pubkeyFromHex parses a Bitcoin public key from a hex encoded string.
 func pubkeyFromHex(keyHex string) (*btcec.PublicKey, error) {
 	bytes, err := hex.DecodeString(keyHex)
@@ -430,25 +421,6 @@ func privkeyFromHex(keyHex string) (*btcec.PrivateKey, error) {
 	key, _ := btcec.PrivKeyFromBytes(btcec.S256(), bytes)
 	return key, nil
 
-}
-
-// pubkeyToHex serializes a Bitcoin public key to a hex encoded string.
-func pubkeyToHex(key *btcec.PublicKey) string {
-	return hex.EncodeToString(key.SerializeCompressed())
-}
-
-// privkeyFromHex serializes a Bitcoin private key to a hex encoded string.
-func privkeyToHex(key *btcec.PrivateKey) string {
-	return hex.EncodeToString(key.Serialize())
-}
-
-// signatureFromHex parses a Bitcoin signature from a hex encoded string.
-func signatureFromHex(sigHex string) (*btcec.Signature, error) {
-	bytes, err := hex.DecodeString(sigHex)
-	if err != nil {
-		return nil, err
-	}
-	return btcec.ParseSignature(bytes, btcec.S256())
 }
 
 // blockFromHex parses a full Bitcoin block from a hex encoded string.
@@ -482,4 +454,44 @@ func calcStaticFee(numHTLCs int) btcutil.Amount {
 	)
 	return feePerKw * (commitWeight +
 		btcutil.Amount(htlcWeight*numHTLCs)) / 1000
+}
+
+// ForceStateTransition executes the necessary interaction between the two
+// commitment state machines to transition to a new state locking in any
+// pending updates. This method is useful when testing interactions between two
+// live state machines.
+func ForceStateTransition(chanA, chanB *LightningChannel) error {
+	aliceSig, aliceHtlcSigs, _, err := chanA.SignNextCommitment()
+	if err != nil {
+		return err
+	}
+	if err = chanB.ReceiveNewCommitment(aliceSig, aliceHtlcSigs); err != nil {
+		return err
+	}
+
+	bobRevocation, _, err := chanB.RevokeCurrentCommitment()
+	if err != nil {
+		return err
+	}
+	bobSig, bobHtlcSigs, _, err := chanB.SignNextCommitment()
+	if err != nil {
+		return err
+	}
+
+	if _, _, _, _, err := chanA.ReceiveRevocation(bobRevocation); err != nil {
+		return err
+	}
+	if err := chanA.ReceiveNewCommitment(bobSig, bobHtlcSigs); err != nil {
+		return err
+	}
+
+	aliceRevocation, _, err := chanA.RevokeCurrentCommitment()
+	if err != nil {
+		return err
+	}
+	if _, _, _, _, err := chanB.ReceiveRevocation(aliceRevocation); err != nil {
+		return err
+	}
+
+	return nil
 }

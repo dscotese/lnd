@@ -3,8 +3,10 @@ package htlcswitch
 import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnpeer"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
@@ -12,18 +14,30 @@ import (
 // which may search, lookup and settle invoices.
 type InvoiceDatabase interface {
 	// LookupInvoice attempts to look up an invoice according to its 32
-	// byte payment hash. This method should also reutrn the min final CLTV
-	// delta for this invoice. We'll use this to ensure that the HTLC
-	// extended to us gives us enough time to settle as we prescribe.
-	LookupInvoice(lntypes.Hash) (channeldb.Invoice, uint32, error)
+	// byte payment hash.
+	LookupInvoice(lntypes.Hash) (channeldb.Invoice, error)
 
-	// SettleInvoice attempts to mark an invoice corresponding to the
-	// passed payment hash as fully settled.
-	SettleInvoice(payHash lntypes.Hash, paidAmount lnwire.MilliSatoshi) error
+	// NotifyExitHopHtlc attempts to mark an invoice as settled. If the
+	// invoice is a debug invoice, then this method is a noop as debug
+	// invoices are never fully settled. The return value describes how the
+	// htlc should be resolved. If the htlc cannot be resolved immediately,
+	// the resolution is sent on the passed in hodlChan later. The eob
+	// field passes the entire onion hop payload into the invoice registry
+	// for decoding purposes.
+	NotifyExitHopHtlc(payHash lntypes.Hash, paidAmount lnwire.MilliSatoshi,
+		expiry uint32, currentHeight int32,
+		circuitKey channeldb.CircuitKey, hodlChan chan<- interface{},
+		eob []byte) (*invoices.HodlEvent, error)
 
 	// CancelInvoice attempts to cancel the invoice corresponding to the
 	// passed payment hash.
 	CancelInvoice(payHash lntypes.Hash) error
+
+	// SettleHodlInvoice settles a hold invoice.
+	SettleHodlInvoice(preimage lntypes.Preimage) error
+
+	// HodlUnsubscribeAll unsubscribes from all hodl events.
+	HodlUnsubscribeAll(subscriber chan<- interface{})
 }
 
 // ChannelLink is an interface which represents the subsystem for managing the
@@ -96,6 +110,14 @@ type ChannelLink interface {
 		incomingTimeout, outgoingTimeout uint32,
 		heightNow uint32) lnwire.FailureMessage
 
+	// HtlcSatifiesPolicyLocal should return a nil error if the passed HTLC
+	// details satisfy the current channel policy.  Otherwise, a valid
+	// protocol failure message should be returned in order to signal the
+	// violation. This call is intended to be used for locally initiated
+	// payments for which there is no corresponding incoming htlc.
+	HtlcSatifiesPolicyLocal(payHash [32]byte, amt lnwire.MilliSatoshi,
+		timeout uint32, heightNow uint32) lnwire.FailureMessage
+
 	// Bandwidth returns the amount of milli-satoshis which current link
 	// might pass through channel link. The value returned from this method
 	// represents the up to date available flow through the channel. This
@@ -138,4 +160,23 @@ type ForwardingLog interface {
 	// sub-systems can then query the contents of the log for analysis,
 	// visualizations, etc.
 	AddForwardingEvents([]channeldb.ForwardingEvent) error
+}
+
+// TowerClient is the primary interface used by the daemon to backup pre-signed
+// justice transactions to watchtowers.
+type TowerClient interface {
+	// RegisterChannel persistently initializes any channel-dependent
+	// parameters within the client. This should be called during link
+	// startup to ensure that the client is able to support the link during
+	// operation.
+	RegisterChannel(lnwire.ChannelID) error
+
+	// BackupState initiates a request to back up a particular revoked
+	// state. If the method returns nil, the backup is guaranteed to be
+	// successful unless the tower is unavailable and client is force quit,
+	// or the justice transaction would create dust outputs when trying to
+	// abide by the negotiated policy. If the channel we're trying to back
+	// up doesn't have a tweak for the remote party's output, then
+	// isTweakless should be true.
+	BackupState(*lnwire.ChannelID, *lnwallet.BreachRetribution, bool) error
 }

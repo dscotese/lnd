@@ -1,6 +1,7 @@
-package main
+package lnd
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -10,10 +11,11 @@ import (
 	"github.com/btcsuite/btclog"
 	"github.com/jrick/logrotate/rotator"
 	"github.com/lightninglabs/neutrino"
-	"github.com/lightningnetwork/lightning-onion"
+	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/chainntnfs"
+	"github.com/lightningnetwork/lnd/chanbackup"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channelnotifier"
 	"github.com/lightningnetwork/lnd/contractcourt"
@@ -23,14 +25,20 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc/autopilotrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/chainrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
+	"github.com/lightningnetwork/lnd/lnrpc/wtclientrpc"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/monitoring"
 	"github.com/lightningnetwork/lnd/netann"
+	"github.com/lightningnetwork/lnd/peernotifier"
 	"github.com/lightningnetwork/lnd/routing"
 	"github.com/lightningnetwork/lnd/signal"
 	"github.com/lightningnetwork/lnd/sweep"
 	"github.com/lightningnetwork/lnd/watchtower"
+	"github.com/lightningnetwork/lnd/watchtower/wtclient"
+	"google.golang.org/grpc"
 )
 
 // Loggers per subsystem.  A single backend logger is created and all subsystem
@@ -82,6 +90,10 @@ var (
 	ntfrLog = build.NewSubLogger("NTFR", backendLog.Logger)
 	irpcLog = build.NewSubLogger("IRPC", backendLog.Logger)
 	chnfLog = build.NewSubLogger("CHNF", backendLog.Logger)
+	chbuLog = build.NewSubLogger("CHBU", backendLog.Logger)
+	promLog = build.NewSubLogger("PROM", backendLog.Logger)
+	wtclLog = build.NewSubLogger("WTCL", backendLog.Logger)
+	prnfLog = build.NewSubLogger("PRNF", backendLog.Logger)
 )
 
 // Initialize package-global logger variables.
@@ -108,6 +120,21 @@ func init() {
 	chainrpc.UseLogger(ntfrLog)
 	invoicesrpc.UseLogger(irpcLog)
 	channelnotifier.UseLogger(chnfLog)
+	chanbackup.UseLogger(chbuLog)
+	monitoring.UseLogger(promLog)
+	wtclient.UseLogger(wtclLog)
+	peernotifier.UseLogger(prnfLog)
+
+	addSubLogger(routerrpc.Subsystem, routerrpc.UseLogger)
+	addSubLogger(wtclientrpc.Subsystem, wtclientrpc.UseLogger)
+}
+
+// addSubLogger is a helper method to conveniently register the logger of a sub
+// system.
+func addSubLogger(subsystem string, useLogger func(btclog.Logger)) {
+	logger := build.NewSubLogger(subsystem, backendLog.Logger)
+	useLogger(logger)
+	subsystemLoggers[subsystem] = logger
 }
 
 // subsystemLoggers maps each subsystem identifier to its associated logger.
@@ -137,9 +164,13 @@ var subsystemLoggers = map[string]btclog.Logger{
 	"INVC": invcLog,
 	"NANN": nannLog,
 	"WTWR": wtwrLog,
-	"NTFR": ntfnLog,
+	"NTFR": ntfrLog,
 	"IRPC": irpcLog,
 	"CHNF": chnfLog,
+	"CHBU": chbuLog,
+	"PROM": promLog,
+	"WTCL": wtclLog,
+	"PRNF": prnfLog,
 }
 
 // initLogRotator initializes the logging rotator to write logs to logFile and
@@ -205,4 +236,37 @@ func (c logClosure) String() string {
 // logging system.
 func newLogClosure(c func() string) logClosure {
 	return logClosure(c)
+}
+
+// errorLogUnaryServerInterceptor is a simple UnaryServerInterceptor that will
+// automatically log any errors that occur when serving a client's unary
+// request.
+func errorLogUnaryServerInterceptor(logger btclog.Logger) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo,
+		handler grpc.UnaryHandler) (interface{}, error) {
+
+		resp, err := handler(ctx, req)
+		if err != nil {
+			// TODO(roasbeef): also log request details?
+			logger.Errorf("[%v]: %v", info.FullMethod, err)
+		}
+
+		return resp, err
+	}
+}
+
+// errorLogStreamServerInterceptor is a simple StreamServerInterceptor that
+// will log any errors that occur while processing a client or server streaming
+// RPC.
+func errorLogStreamServerInterceptor(logger btclog.Logger) grpc.StreamServerInterceptor {
+	return func(srv interface{}, ss grpc.ServerStream,
+		info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+
+		err := handler(srv, ss)
+		if err != nil {
+			logger.Errorf("[%v]: %v", info.FullMethod, err)
+		}
+
+		return err
+	}
 }

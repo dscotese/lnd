@@ -1,4 +1,4 @@
-package main
+package lnd
 
 import (
 	"fmt"
@@ -427,6 +427,22 @@ func (c *channelCloser) ProcessCloseMsg(msg lnwire.Message) ([]lnwire.Message, b
 		}
 		c.closingTx = closeTx
 
+		// Before closing, we'll attempt to send a disable update for
+		// the channel. We do so before closing the channel as otherwise
+		// the current edge policy won't be retrievable from the graph.
+		if err := c.cfg.disableChannel(c.chanPoint); err != nil {
+			peerLog.Warnf("Unable to disable channel %v on "+
+				"close: %v", c.chanPoint, err)
+		}
+
+		// Before publishing the closing tx, we persist it to the
+		// database, such that it can be republished if something goes
+		// wrong.
+		err = c.cfg.channel.MarkCommitmentBroadcasted(closeTx)
+		if err != nil {
+			return nil, false, err
+		}
+
 		// With the closing transaction crafted, we'll now broadcast it
 		// to the network.
 		peerLog.Infof("Broadcasting cooperative close tx: %v",
@@ -436,19 +452,6 @@ func (c *channelCloser) ProcessCloseMsg(msg lnwire.Message) ([]lnwire.Message, b
 		if err := c.cfg.broadcastTx(closeTx); err != nil {
 			return nil, false, err
 		}
-		if c.cfg.channel.MarkCommitmentBroadcasted(); err != nil {
-			return nil, false, err
-		}
-
-		// We'll attempt to disable the channel in the background to
-		// avoid blocking due to sending the update message to all
-		// active peers.
-		go func() {
-			if err := c.cfg.disableChannel(c.chanPoint); err != nil {
-				peerLog.Errorf("Unable to disable channel %v on "+
-					"close: %v", c.chanPoint, err)
-			}
-		}()
 
 		// Finally, we'll transition to the closeFinished state, and
 		// also return the final close signed message we sent.

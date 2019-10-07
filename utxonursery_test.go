@@ -1,6 +1,6 @@
 // +build !rpctest
 
-package main
+package lnd
 
 import (
 	"bytes"
@@ -1019,21 +1019,6 @@ func (i *nurseryStoreInterceptor) RemoveChannel(chanPoint *wire.OutPoint) error 
 	return i.ns.RemoveChannel(chanPoint)
 }
 
-type nurseryMockSigner struct {
-}
-
-func (m *nurseryMockSigner) SignOutputRaw(tx *wire.MsgTx,
-	signDesc *input.SignDescriptor) ([]byte, error) {
-
-	return []byte{}, nil
-}
-
-func (m *nurseryMockSigner) ComputeInputScript(tx *wire.MsgTx,
-	signDesc *input.SignDescriptor) (*input.Script, error) {
-
-	return &input.Script{}, nil
-}
-
 type mockSweeper struct {
 	lock sync.Mutex
 
@@ -1051,7 +1036,9 @@ func newMockSweeper(t *testing.T) *mockSweeper {
 	}
 }
 
-func (s *mockSweeper) sweepInput(input input.Input) (chan sweep.Result, error) {
+func (s *mockSweeper) sweepInput(input input.Input,
+	_ sweep.FeePreference) (chan sweep.Result, error) {
+
 	utxnLog.Debugf("mockSweeper sweepInput called for %v", *input.OutPoint())
 
 	select {

@@ -9,6 +9,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
+	"github.com/btcsuite/btcwallet/wallet/txauthor"
 )
 
 // AddressType is an enum-like type which denotes the possible address types
@@ -16,16 +17,16 @@ import (
 type AddressType uint8
 
 const (
+	// UnknownAddressType represents an output with an unknown or non-standard
+	// script.
+	UnknownAddressType AddressType = iota
+
 	// WitnessPubKey represents a p2wkh address.
-	WitnessPubKey AddressType = iota
+	WitnessPubKey
 
 	// NestedWitnessPubKey represents a p2sh output which is itself a
 	// nested p2wkh output.
 	NestedWitnessPubKey
-
-	// UnknownAddressType represents an output with an unknown or non-standard
-	// script.
-	UnknownAddressType
 )
 
 var (
@@ -47,6 +48,10 @@ var (
 	ErrNotMine = errors.New("the passed output doesn't belong to the wallet")
 )
 
+// ErrNoOutputs is returned if we try to create a transaction with no outputs
+// or send coins to a set of outputs that is empty.
+var ErrNoOutputs = errors.New("no outputs")
+
 // Utxo is an unspent output denoted by its outpoint, and output value of the
 // original output.
 type Utxo struct {
@@ -54,8 +59,6 @@ type Utxo struct {
 	Value         btcutil.Amount
 	Confirmations int64
 	PkScript      []byte
-	RedeemScript  []byte
-	WitnessScript []byte
 	wire.OutPoint
 }
 
@@ -95,6 +98,9 @@ type TransactionDetail struct {
 
 	// DestAddresses are the destinations for a transaction
 	DestAddresses []btcutil.Address
+
+	// RawTx returns the raw serialized transaction.
+	RawTx []byte
 }
 
 // TransactionSubscription is an interface which describes an object capable of
@@ -129,7 +135,7 @@ type WalletController interface {
 	// passed outpoint. If the base wallet determines this output is under
 	// its control, then the original txout should be returned.  Otherwise,
 	// a non-nil error value of ErrNotMine should be returned instead.
-	FetchInputInfo(prevOut *wire.OutPoint) (*wire.TxOut, error)
+	FetchInputInfo(prevOut *wire.OutPoint) (*Utxo, error)
 
 	// ConfirmedBalance returns the sum of all the wallet's unspent outputs
 	// that have at least confs confirmations. If confs is set to zero,
@@ -149,6 +155,14 @@ type WalletController interface {
 	// p2wsh, etc.
 	NewAddress(addrType AddressType, change bool) (btcutil.Address, error)
 
+	// LastUnusedAddress returns the last *unused* address known by the
+	// wallet. An address is unused if it hasn't received any payments.
+	// This can be useful in UIs in order to continually show the
+	// "freshest" address without having to worry about "address inflation"
+	// caused by continual refreshing. Similar to NewAddress it can derive
+	// a specified address type. By default, this is a non-change address.
+	LastUnusedAddress(addrType AddressType) (btcutil.Address, error)
+
 	// IsOurAddress checks if the passed address belongs to this wallet
 	IsOurAddress(a btcutil.Address) bool
 
@@ -159,6 +173,19 @@ type WalletController interface {
 	// be used when crafting the transaction.
 	SendOutputs(outputs []*wire.TxOut,
 		feeRate SatPerKWeight) (*wire.MsgTx, error)
+
+	// CreateSimpleTx creates a Bitcoin transaction paying to the specified
+	// outputs. The transaction is not broadcasted to the network. In the
+	// case the wallet has insufficient funds, or the outputs are
+	// non-standard, an error should be returned. This method also takes
+	// the target fee expressed in sat/kw that should be used when crafting
+	// the transaction.
+	//
+	// NOTE: The dryRun argument can be set true to create a tx that
+	// doesn't alter the database. A tx created with this set to true
+	// SHOULD NOT be broadcasted.
+	CreateSimpleTx(outputs []*wire.TxOut, feeRate SatPerKWeight,
+		dryRun bool) (*txauthor.AuthoredTx, error)
 
 	// ListUnspentWitness returns all unspent outputs which are version 0
 	// witness programs. The 'minconfirms' and 'maxconfirms' parameters
@@ -241,8 +268,10 @@ type BlockChainIO interface {
 	// script that the outpoint creates. In the case that the output is in
 	// the UTXO set, then the output corresponding to that output is
 	// returned.  Otherwise, a non-nil error will be returned.
-	GetUtxo(op *wire.OutPoint, pkScript []byte,
-		heightHint uint32) (*wire.TxOut, error)
+	// As for some backends this call can initiate a rescan, the passed
+	// cancel channel can be closed to abort the call.
+	GetUtxo(op *wire.OutPoint, pkScript []byte, heightHint uint32,
+		cancel <-chan struct{}) (*wire.TxOut, error)
 
 	// GetBlockHash returns the hash of the block in the best blockchain
 	// at the given height.
@@ -263,20 +292,6 @@ type MessageSigner interface {
 	// is unable to be found, then an error will be returned. The actual
 	// digest signed is the double SHA-256 of the passed message.
 	SignMessage(pubKey *btcec.PublicKey, msg []byte) (*btcec.Signature, error)
-}
-
-// PreimageCache is an interface that represents a global cache for preimages.
-// We'll utilize this cache to communicate the discovery of new preimages
-// across sub-systems.
-type PreimageCache interface {
-	// LookupPreimage attempts to look up a preimage according to its hash.
-	// If found, the preimage is returned along with true for the second
-	// argument. Otherwise, it'll return false.
-	LookupPreimage(hash []byte) ([]byte, bool)
-
-	// AddPreimage attempts to add a new preimage to the global cache. If
-	// successful a nil error will be returned.
-	AddPreimage(preimage []byte) error
 }
 
 // WalletDriver represents a "driver" for a particular concrete

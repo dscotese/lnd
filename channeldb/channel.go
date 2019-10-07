@@ -16,6 +16,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
 	"github.com/coreos/bbolt"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/shachain"
@@ -57,6 +58,10 @@ var (
 	// dataLossCommitPointKey stores the commitment point received from the
 	// remote peer during a channel sync in case we have lost channel state.
 	dataLossCommitPointKey = []byte("data-loss-commit-point-key")
+
+	// closingTxKey points to a the closing tx that we broadcasted when
+	// moving the channel to state CommitBroadcasted.
+	closingTxKey = []byte("closing-tx-key")
 
 	// commitDiffKey stores the current pending commitment state we've
 	// extended to the remote party (if any). Each time we propose a new
@@ -103,10 +108,18 @@ var (
 	// in the database.
 	ErrNoCommitPoint = fmt.Errorf("no commit point found")
 
+	// ErrNoCloseTx is returned when no closing tx is found for a channel
+	// in the state CommitBroadcasted.
+	ErrNoCloseTx = fmt.Errorf("no closing tx found")
+
 	// ErrNoRestoredChannelMutation is returned when a caller attempts to
 	// mutate a channel that's been recovered.
 	ErrNoRestoredChannelMutation = fmt.Errorf("cannot mutate restored " +
 		"channel state")
+
+	// ErrChanBorked is returned when a caller attempts to mutate a borked
+	// channel.
+	ErrChanBorked = fmt.Errorf("cannot mutate borked channel")
 )
 
 // ChannelType is an enum-like type that describes one of several possible
@@ -122,13 +135,30 @@ const (
 
 	// SingleFunder represents a channel wherein one party solely funds the
 	// entire capacity of the channel.
-	SingleFunder = 0
+	SingleFunder ChannelType = 0
 
 	// DualFunder represents a channel wherein both parties contribute
 	// funds towards the total capacity of the channel. The channel may be
 	// funded symmetrically or asymmetrically.
-	DualFunder = 1
+	DualFunder ChannelType = 1
+
+	// SingleFunderTweakless is similar to the basic SingleFunder channel
+	// type, but it omits the tweak for one's key in the commitment
+	// transaction of the remote party.
+	SingleFunderTweakless ChannelType = 2
 )
+
+// IsSingleFunder returns true if the channel type if one of the known single
+// funder variants.
+func (c ChannelType) IsSingleFunder() bool {
+	return c == SingleFunder || c == SingleFunderTweakless
+}
+
+// IsTweakless returns true if the target channel uses a commitment that
+// doesn't tweak the key for the remote party.
+func (c ChannelType) IsTweakless() bool {
+	return c == SingleFunderTweakless
+}
 
 // ChannelConstraints represents a set of constraints meant to allow a node to
 // limit their exposure, enact flow control and ensure that all HTLCs are
@@ -396,7 +426,7 @@ type OpenChannel struct {
 	ChainHash chainhash.Hash
 
 	// FundingOutpoint is the outpoint of the final funding transaction.
-	// This value uniquely and globally identities the channel within the
+	// This value uniquely and globally identifies the channel within the
 	// target blockchain as specified by the chain hash parameter.
 	FundingOutpoint wire.OutPoint
 
@@ -510,16 +540,6 @@ type OpenChannel struct {
 	sync.RWMutex
 }
 
-// FullSync serializes, and writes to disk the *full* channel state, using
-// both the active channel bucket to store the prefixed column fields, and the
-// remote node's ID to store the remainder of the channel state.
-func (c *OpenChannel) FullSync() error {
-	c.Lock()
-	defer c.Unlock()
-
-	return c.Db.Update(c.fullSync)
-}
-
 // ShortChanID returns the current ShortChannelID of this channel.
 func (c *OpenChannel) ShortChanID() lnwire.ShortChannelID {
 	c.RLock()
@@ -543,6 +563,16 @@ func (c *OpenChannel) ApplyChanStatus(status ChannelStatus) error {
 	defer c.Unlock()
 
 	return c.putChanStatus(status)
+}
+
+// ClearChanStatus allows the caller to clear a particular channel status from
+// the primary channel status bit field. After this method returns, a call to
+// HasChanStatus(status) should return false.
+func (c *OpenChannel) ClearChanStatus(status ChannelStatus) error {
+	c.Lock()
+	defer c.Unlock()
+
+	return c.clearChanStatus(status)
 }
 
 // HasChanStatus returns true if the internal bitfield channel status of the
@@ -634,9 +664,8 @@ func fetchChanBucket(tx *bbolt.Tx, nodeKey *btcec.PublicKey,
 	return chanBucket, nil
 }
 
-// fullSync is an internal version of the FullSync method which allows callers
-// to sync the contents of an OpenChannel while re-using an existing database
-// transaction.
+// fullSync syncs the contents of an OpenChannel while re-using an existing
+// database transaction.
 func (c *OpenChannel) fullSync(tx *bbolt.Tx) error {
 	// First fetch the top level bucket which stores all data related to
 	// current, active channels.
@@ -722,44 +751,16 @@ func (c *OpenChannel) MarkDataLoss(commitPoint *btcec.PublicKey) error {
 	c.Lock()
 	defer c.Unlock()
 
-	var status ChannelStatus
-	if err := c.Db.Update(func(tx *bbolt.Tx) error {
-		chanBucket, err := fetchChanBucket(
-			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
-		)
-		if err != nil {
-			return err
-		}
-
-		channel, err := fetchOpenChannel(chanBucket, &c.FundingOutpoint)
-		if err != nil {
-			return err
-		}
-
-		// Add status LocalDataLoss to the existing bitvector found in
-		// the DB.
-		status = channel.chanStatus | ChanStatusLocalDataLoss
-		channel.chanStatus = status
-
-		var b bytes.Buffer
-		if err := WriteElement(&b, commitPoint); err != nil {
-			return err
-		}
-
-		err = chanBucket.Put(dataLossCommitPointKey, b.Bytes())
-		if err != nil {
-			return err
-		}
-
-		return putOpenChannel(chanBucket, channel)
-	}); err != nil {
+	var b bytes.Buffer
+	if err := WriteElement(&b, commitPoint); err != nil {
 		return err
 	}
 
-	// Update the in-memory representation to keep it in sync with the DB.
-	c.chanStatus = status
+	putCommitPoint := func(chanBucket *bbolt.Bucket) error {
+		return chanBucket.Put(dataLossCommitPointKey, b.Bytes())
+	}
 
-	return nil
+	return c.putChanStatus(ChanStatusLocalDataLoss, putCommitPoint)
 }
 
 // DataLossCommitPoint retrieves the stored commit point set during
@@ -807,17 +808,163 @@ func (c *OpenChannel) MarkBorked() error {
 	return c.putChanStatus(ChanStatusBorked)
 }
 
-// MarkCommitmentBroadcasted marks the channel as a commitment transaction has
-// been broadcast, either our own or the remote, and we should watch the chain
-// for it to confirm before taking any further action.
-func (c *OpenChannel) MarkCommitmentBroadcasted() error {
+// ChanSyncMsg returns the ChannelReestablish message that should be sent upon
+// reconnection with the remote peer that we're maintaining this channel with.
+// The information contained within this message is necessary to re-sync our
+// commitment chains in the case of a last or only partially processed message.
+// When the remote party receiver this message one of three things may happen:
+//
+//   1. We're fully synced and no messages need to be sent.
+//   2. We didn't get the last CommitSig message they sent, to they'll re-send
+//      it.
+//   3. We didn't get the last RevokeAndAck message they sent, so they'll
+//      re-send it.
+//
+// If this is a restored channel, having status ChanStatusRestored, then we'll
+// modify our typical chan sync message to ensure they force close even if
+// we're on the very first state.
+func (c *OpenChannel) ChanSyncMsg() (*lnwire.ChannelReestablish, error) {
 	c.Lock()
 	defer c.Unlock()
 
-	return c.putChanStatus(ChanStatusCommitBroadcasted)
+	// The remote commitment height that we'll send in the
+	// ChannelReestablish message is our current commitment height plus
+	// one. If the receiver thinks that our commitment height is actually
+	// *equal* to this value, then they'll re-send the last commitment that
+	// they sent but we never fully processed.
+	localHeight := c.LocalCommitment.CommitHeight
+	nextLocalCommitHeight := localHeight + 1
+
+	// The second value we'll send is the height of the remote commitment
+	// from our PoV. If the receiver thinks that their height is actually
+	// *one plus* this value, then they'll re-send their last revocation.
+	remoteChainTipHeight := c.RemoteCommitment.CommitHeight
+
+	// If this channel has undergone a commitment update, then in order to
+	// prove to the remote party our knowledge of their prior commitment
+	// state, we'll also send over the last commitment secret that the
+	// remote party sent.
+	var lastCommitSecret [32]byte
+	if remoteChainTipHeight != 0 {
+		remoteSecret, err := c.RevocationStore.LookUp(
+			remoteChainTipHeight - 1,
+		)
+		if err != nil {
+			return nil, err
+		}
+		lastCommitSecret = [32]byte(*remoteSecret)
+	}
+
+	// Additionally, we'll send over the current unrevoked commitment on
+	// our local commitment transaction.
+	currentCommitSecret, err := c.RevocationProducer.AtIndex(
+		localHeight,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// If we've restored this channel, then we'll purposefully give them an
+	// invalid LocalUnrevokedCommitPoint so they'll force close the channel
+	// allowing us to sweep our funds.
+	if c.hasChanStatus(ChanStatusRestored) {
+		currentCommitSecret[0] ^= 1
+
+		// If this is a tweakless channel, then we'll purposefully send
+		// a next local height taht's invalid to trigger a force close
+		// on their end. We do this as tweakless channels don't require
+		// that the commitment point is valid, only that it's present.
+		if c.ChanType.IsTweakless() {
+			nextLocalCommitHeight = 0
+		}
+	}
+
+	return &lnwire.ChannelReestablish{
+		ChanID: lnwire.NewChanIDFromOutPoint(
+			&c.FundingOutpoint,
+		),
+		NextLocalCommitHeight:  nextLocalCommitHeight,
+		RemoteCommitTailHeight: remoteChainTipHeight,
+		LastRemoteCommitSecret: lastCommitSecret,
+		LocalUnrevokedCommitPoint: input.ComputeCommitmentPoint(
+			currentCommitSecret[:],
+		),
+	}, nil
 }
 
-func (c *OpenChannel) putChanStatus(status ChannelStatus) error {
+// isBorked returns true if the channel has been marked as borked in the
+// database. This requires an existing database transaction to already be
+// active.
+//
+// NOTE: The primary mutex should already be held before this method is called.
+func (c *OpenChannel) isBorked(chanBucket *bbolt.Bucket) (bool, error) {
+	channel, err := fetchOpenChannel(chanBucket, &c.FundingOutpoint)
+	if err != nil {
+		return false, err
+	}
+
+	return channel.chanStatus != ChanStatusDefault, nil
+}
+
+// MarkCommitmentBroadcasted marks the channel as a commitment transaction has
+// been broadcast, either our own or the remote, and we should watch the chain
+// for it to confirm before taking any further action. It takes as argument the
+// closing tx _we believe_ will appear in the chain. This is only used to
+// republish this tx at startup to ensure propagation, and we should still
+// handle the case where a different tx actually hits the chain.
+func (c *OpenChannel) MarkCommitmentBroadcasted(closeTx *wire.MsgTx) error {
+	c.Lock()
+	defer c.Unlock()
+
+	var b bytes.Buffer
+	if err := WriteElement(&b, closeTx); err != nil {
+		return err
+	}
+
+	putClosingTx := func(chanBucket *bbolt.Bucket) error {
+		return chanBucket.Put(closingTxKey, b.Bytes())
+	}
+
+	return c.putChanStatus(ChanStatusCommitBroadcasted, putClosingTx)
+}
+
+// BroadcastedCommitment retrieves the stored closing tx set during
+// MarkCommitmentBroadcasted. If not found ErrNoCloseTx is returned.
+func (c *OpenChannel) BroadcastedCommitment() (*wire.MsgTx, error) {
+	var closeTx *wire.MsgTx
+
+	err := c.Db.View(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
+		switch err {
+		case nil:
+		case ErrNoChanDBExists, ErrNoActiveChannels, ErrChannelNotFound:
+			return ErrNoCloseTx
+		default:
+			return err
+		}
+
+		bs := chanBucket.Get(closingTxKey)
+		if bs == nil {
+			return ErrNoCloseTx
+		}
+		r := bytes.NewReader(bs)
+		return ReadElement(r, &closeTx)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return closeTx, nil
+}
+
+// putChanStatus appends the given status to the channel. fs is an optional
+// list of closures that are given the chanBucket in order to atomically add
+// extra information together with the new status.
+func (c *OpenChannel) putChanStatus(status ChannelStatus,
+	fs ...func(*bbolt.Bucket) error) error {
+
 	if err := c.Db.Update(func(tx *bbolt.Tx) error {
 		chanBucket, err := fetchChanBucket(
 			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
@@ -833,6 +980,45 @@ func (c *OpenChannel) putChanStatus(status ChannelStatus) error {
 
 		// Add this status to the existing bitvector found in the DB.
 		status = channel.chanStatus | status
+		channel.chanStatus = status
+
+		if err := putOpenChannel(chanBucket, channel); err != nil {
+			return err
+		}
+
+		for _, f := range fs {
+			if err := f(chanBucket); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Update the in-memory representation to keep it in sync with the DB.
+	c.chanStatus = status
+
+	return nil
+}
+
+func (c *OpenChannel) clearChanStatus(status ChannelStatus) error {
+	if err := c.Db.Update(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
+		if err != nil {
+			return err
+		}
+
+		channel, err := fetchOpenChannel(chanBucket, &c.FundingOutpoint)
+		if err != nil {
+			return err
+		}
+
+		// Unset this bit in the bitvector on disk.
+		status = channel.chanStatus & ^status
 		channel.chanStatus = status
 
 		return putOpenChannel(chanBucket, channel)
@@ -978,12 +1164,22 @@ func (c *OpenChannel) UpdateCommitment(newCommitment *ChannelCommitment) error {
 			return err
 		}
 
+		// If the channel is marked as borked, then for safety reasons,
+		// we shouldn't attempt any further updates.
+		isBorked, err := c.isBorked(chanBucket)
+		if err != nil {
+			return err
+		}
+		if isBorked {
+			return ErrChanBorked
+		}
+
 		if err = putChanInfo(chanBucket, c); err != nil {
 			return fmt.Errorf("unable to store chan info: %v", err)
 		}
 
-		// With the proper bucket fetched, we'll now write toe latest
-		// commitment state to dis for the target party.
+		// With the proper bucket fetched, we'll now write the latest
+		// commitment state to disk for the target party.
 		err = putChanCommitment(
 			chanBucket, newCommitment, true,
 		)
@@ -1392,7 +1588,7 @@ func (c *OpenChannel) AppendRemoteCommitChain(diff *CommitDiff) error {
 	defer c.Unlock()
 
 	// If this is a restored channel, then we want to avoid mutating the
-	// state as all, as it's impossible to do so in a protocol compliant
+	// state at all, as it's impossible to do so in a protocol compliant
 	// manner.
 	if c.hasChanStatus(ChanStatusRestored) {
 		return ErrNoRestoredChannelMutation
@@ -1406,6 +1602,16 @@ func (c *OpenChannel) AppendRemoteCommitChain(diff *CommitDiff) error {
 		)
 		if err != nil {
 			return err
+		}
+
+		// If the channel is marked as borked, then for safety reasons,
+		// we shouldn't attempt any further updates.
+		isBorked, err := c.isBorked(chanBucket)
+		if err != nil {
+			return err
+		}
+		if isBorked {
+			return ErrChanBorked
 		}
 
 		// Any outgoing settles and fails necessarily have a
@@ -1523,7 +1729,7 @@ func (c *OpenChannel) AdvanceCommitChainTail(fwdPkg *FwdPkg) error {
 	defer c.Unlock()
 
 	// If this is a restored channel, then we want to avoid mutating the
-	// state as all, as it's impossible to do so in a protocol compliant
+	// state at all, as it's impossible to do so in a protocol compliant
 	// manner.
 	if c.hasChanStatus(ChanStatusRestored) {
 		return ErrNoRestoredChannelMutation
@@ -1537,6 +1743,16 @@ func (c *OpenChannel) AdvanceCommitChainTail(fwdPkg *FwdPkg) error {
 		)
 		if err != nil {
 			return err
+		}
+
+		// If the channel is marked as borked, then for safety reasons,
+		// we shouldn't attempt any further updates.
+		isBorked, err := c.isBorked(chanBucket)
+		if err != nil {
+			return err
+		}
+		if isBorked {
+			return ErrChanBorked
 		}
 
 		// Persist the latest preimage state to disk as the remote peer
@@ -1703,7 +1919,8 @@ func (c *OpenChannel) RemoveFwdPkg(height uint64) error {
 
 // RevocationLogTail returns the "tail", or the end of the current revocation
 // log. This entry represents the last previous state for the remote node's
-// commitment chain. The ChannelDelta returned by this method will always lag one state behind the most current (unrevoked) state of the remote node's
+// commitment chain. The ChannelDelta returned by this method will always lag
+// one state behind the most current (unrevoked) state of the remote node's
 // commitment chain.
 func (c *OpenChannel) RevocationLogTail() (*ChannelCommitment, error) {
 	c.RLock()
@@ -1754,10 +1971,10 @@ func (c *OpenChannel) RevocationLogTail() (*ChannelCommitment, error) {
 }
 
 // CommitmentHeight returns the current commitment height. The commitment
-// height represents the number of updates to the commitment state to data.
+// height represents the number of updates to the commitment state to date.
 // This value is always monotonically increasing. This method is provided in
 // order to allow multiple instances of a particular open channel to obtain a
-// consistent view of the number of channel updates to data.
+// consistent view of the number of channel updates to date.
 func (c *OpenChannel) CommitmentHeight() (uint64, error) {
 	c.RLock()
 	defer c.RUnlock()
@@ -1782,7 +1999,7 @@ func (c *OpenChannel) CommitmentHeight() (uint64, error) {
 		return nil
 	})
 	if err != nil {
-		return 0, nil
+		return 0, err
 	}
 
 	return height, nil
@@ -1918,13 +2135,13 @@ type ChannelCloseSummary struct {
 	// confirmed, but not yet been fully resolved. In the case of a channel
 	// that has been cooperatively closed, it will go straight into the
 	// fully resolved state as soon as the closing transaction has been
-	// confirmed. However, for channel that have been force closed, they'll
+	// confirmed. However, for channels that have been force closed, they'll
 	// stay marked as "pending" until _all_ the pending funds have been
 	// swept.
 	IsPending bool
 
 	// RemoteCurrentRevocation is the current revocation for their
-	// commitment transaction. However, since this the derived public key,
+	// commitment transaction. However, since this is the derived public key,
 	// we don't yet have the private key so we aren't yet able to verify
 	// that it's actually in the hash chain.
 	RemoteCurrentRevocation *btcec.PublicKey
@@ -2000,10 +2217,6 @@ func (c *OpenChannel) CloseChannel(summary *ChannelCloseSummary) error {
 		// information stored within the revocation log.
 		logBucket := chanBucket.Bucket(revocationLogBucket)
 		if logBucket != nil {
-			err := wipeChannelLogEntries(logBucket)
-			if err != nil {
-				return err
-			}
 			err = chanBucket.DeleteBucket(revocationLogBucket)
 			if err != nil {
 				return err
@@ -2214,23 +2427,6 @@ func serializeChannelCloseSummary(w io.Writer, cs *ChannelCloseSummary) error {
 	return nil
 }
 
-func fetchChannelCloseSummary(tx *bbolt.Tx,
-	chanID []byte) (*ChannelCloseSummary, error) {
-
-	closedChanBucket, err := tx.CreateBucketIfNotExists(closedChannelBucket)
-	if err != nil {
-		return nil, err
-	}
-
-	summaryBytes := closedChanBucket.Get(chanID)
-	if summaryBytes == nil {
-		return nil, fmt.Errorf("closed channel summary not found")
-	}
-
-	summaryReader := bytes.NewReader(summaryBytes)
-	return deserializeCloseChannelSummary(summaryReader)
-}
-
 func deserializeCloseChannelSummary(r io.Reader) (*ChannelCloseSummary, error) {
 	c := &ChannelCloseSummary{}
 
@@ -2335,7 +2531,9 @@ func putChanInfo(chanBucket *bbolt.Bucket, channel *OpenChannel) error {
 	}
 
 	// For single funder channels that we initiated, write the funding txn.
-	if channel.ChanType == SingleFunder && channel.IsInitiator {
+	if channel.ChanType.IsSingleFunder() && channel.IsInitiator &&
+		!channel.hasChanStatus(ChanStatusRestored) {
+
 		if err := WriteElement(&w, channel.FundingTxn); err != nil {
 			return err
 		}
@@ -2455,7 +2653,9 @@ func fetchChanInfo(chanBucket *bbolt.Bucket, channel *OpenChannel) error {
 	}
 
 	// For single funder channels that we initiated, read the funding txn.
-	if channel.ChanType == SingleFunder && channel.IsInitiator {
+	if channel.ChanType.IsSingleFunder() && channel.IsInitiator &&
+		!channel.hasChanStatus(ChanStatusRestored) {
+
 		if err := ReadElement(r, &channel.FundingTxn); err != nil {
 			return err
 		}
@@ -2591,13 +2791,6 @@ func makeLogKey(updateNum uint64) [8]byte {
 	return key
 }
 
-// readLogKey parse the first 8- bytes of a byte slice into a uint64.
-//
-// NOTE: The slice must be at least 8 bytes long.
-func readLogKey(b []byte) uint64 {
-	return byteOrder.Uint64(b)
-}
-
 func appendChannelLogEntry(log *bbolt.Bucket,
 	commit *ChannelCommitment) error {
 
@@ -2621,17 +2814,4 @@ func fetchChannelLogEntry(log *bbolt.Bucket,
 
 	commitReader := bytes.NewReader(commitBytes)
 	return deserializeChanCommit(commitReader)
-}
-
-func wipeChannelLogEntries(log *bbolt.Bucket) error {
-	// TODO(roasbeef): comment
-
-	logCursor := log.Cursor()
-	for k, _ := logCursor.First(); k != nil; k, _ = logCursor.Next() {
-		if err := logCursor.Delete(); err != nil {
-			return err
-		}
-	}
-
-	return nil
 }

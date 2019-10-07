@@ -2,7 +2,6 @@ package channeldb
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"reflect"
 	"testing"
 	"time"
@@ -25,6 +24,8 @@ func randInvoice(value lnwire.MilliSatoshi) (*Invoice, error) {
 			PaymentPreimage: pre,
 			Value:           value,
 		},
+		Htlcs:  map[CircuitKey]*InvoiceHTLC{},
+		Expiry: 4000,
 	}
 	i.Memo = []byte("memo")
 	i.Receipt = []byte("receipt")
@@ -60,6 +61,7 @@ func TestInvoiceWorkflow(t *testing.T) {
 		// Use single second precision to avoid false positive test
 		// failures due to the monotonic time component.
 		CreationDate: time.Unix(time.Now().Unix(), 0),
+		Htlcs:        map[CircuitKey]*InvoiceHTLC{},
 	}
 	fakeInvoice.Memo = []byte("memo")
 	fakeInvoice.Receipt = []byte("receipt")
@@ -67,17 +69,18 @@ func TestInvoiceWorkflow(t *testing.T) {
 	copy(fakeInvoice.Terms.PaymentPreimage[:], rev[:])
 	fakeInvoice.Terms.Value = lnwire.NewMSatFromSatoshis(10000)
 
+	paymentHash := fakeInvoice.Terms.PaymentPreimage.Hash()
+
 	// Add the invoice to the database, this should succeed as there aren't
 	// any existing invoices within the database with the same payment
 	// hash.
-	if _, err := db.AddInvoice(fakeInvoice); err != nil {
+	if _, err := db.AddInvoice(fakeInvoice, paymentHash); err != nil {
 		t.Fatalf("unable to find invoice: %v", err)
 	}
 
 	// Attempt to retrieve the invoice which was just added to the
 	// database. It should be found, and the invoice returned should be
 	// identical to the one created above.
-	paymentHash := sha256.Sum256(fakeInvoice.Terms.PaymentPreimage[:])
 	dbInvoice, err := db.LookupInvoice(paymentHash)
 	if err != nil {
 		t.Fatalf("unable to find invoice: %v", err)
@@ -99,7 +102,8 @@ func TestInvoiceWorkflow(t *testing.T) {
 	// now have the settled bit toggle to true and a non-default
 	// SettledDate
 	payAmt := fakeInvoice.Terms.Value * 2
-	if _, err := db.SettleInvoice(paymentHash, payAmt); err != nil {
+	_, err = db.UpdateInvoice(paymentHash, getUpdateInvoice(payAmt))
+	if err != nil {
 		t.Fatalf("unable to settle invoice: %v", err)
 	}
 	dbInvoice2, err := db.LookupInvoice(paymentHash)
@@ -126,7 +130,7 @@ func TestInvoiceWorkflow(t *testing.T) {
 
 	// Attempt to insert generated above again, this should fail as
 	// duplicates are rejected by the processing logic.
-	if _, err := db.AddInvoice(fakeInvoice); err != ErrDuplicateInvoice {
+	if _, err := db.AddInvoice(fakeInvoice, paymentHash); err != ErrDuplicateInvoice {
 		t.Fatalf("invoice insertion should fail due to duplication, "+
 			"instead %v", err)
 	}
@@ -149,7 +153,8 @@ func TestInvoiceWorkflow(t *testing.T) {
 			t.Fatalf("unable to create invoice: %v", err)
 		}
 
-		if _, err := db.AddInvoice(invoice); err != nil {
+		hash := invoice.Terms.PaymentPreimage.Hash()
+		if _, err := db.AddInvoice(invoice, hash); err != nil {
 			t.Fatalf("unable to add invoice %v", err)
 		}
 
@@ -198,7 +203,9 @@ func TestInvoiceAddTimeSeries(t *testing.T) {
 			t.Fatalf("unable to create invoice: %v", err)
 		}
 
-		if _, err := db.AddInvoice(invoice); err != nil {
+		paymentHash := invoice.Terms.PaymentPreimage.Hash()
+
+		if _, err := db.AddInvoice(invoice, paymentHash); err != nil {
 			t.Fatalf("unable to add invoice %v", err)
 		}
 
@@ -256,11 +263,11 @@ func TestInvoiceAddTimeSeries(t *testing.T) {
 	for i := 10; i < len(invoices); i++ {
 		invoice := &invoices[i]
 
-		paymentHash := sha256.Sum256(
-			invoice.Terms.PaymentPreimage[:],
-		)
+		paymentHash := invoice.Terms.PaymentPreimage.Hash()
 
-		_, err := db.SettleInvoice(paymentHash, 0)
+		_, err := db.UpdateInvoice(
+			paymentHash, getUpdateInvoice(0),
+		)
 		if err != nil {
 			t.Fatalf("unable to settle invoice: %v", err)
 		}
@@ -326,6 +333,7 @@ func TestDuplicateSettleInvoice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to make test db: %v", err)
 	}
+	db.now = func() time.Time { return time.Unix(1, 0) }
 
 	// We'll start out by creating an invoice and writing it to the DB.
 	amt := lnwire.NewMSatFromSatoshis(1000)
@@ -334,13 +342,16 @@ func TestDuplicateSettleInvoice(t *testing.T) {
 		t.Fatalf("unable to create invoice: %v", err)
 	}
 
-	if _, err := db.AddInvoice(invoice); err != nil {
+	payHash := invoice.Terms.PaymentPreimage.Hash()
+
+	if _, err := db.AddInvoice(invoice, payHash); err != nil {
 		t.Fatalf("unable to add invoice %v", err)
 	}
 
 	// With the invoice in the DB, we'll now attempt to settle the invoice.
-	payHash := sha256.Sum256(invoice.Terms.PaymentPreimage[:])
-	dbInvoice, err := db.SettleInvoice(payHash, amt)
+	dbInvoice, err := db.UpdateInvoice(
+		payHash, getUpdateInvoice(amt),
+	)
 	if err != nil {
 		t.Fatalf("unable to settle invoice: %v", err)
 	}
@@ -351,6 +362,14 @@ func TestDuplicateSettleInvoice(t *testing.T) {
 	invoice.Terms.State = ContractSettled
 	invoice.AmtPaid = amt
 	invoice.SettleDate = dbInvoice.SettleDate
+	invoice.Htlcs = map[CircuitKey]*InvoiceHTLC{
+		{}: {
+			Amt:         amt,
+			AcceptTime:  time.Unix(1, 0),
+			ResolveTime: time.Unix(1, 0),
+			State:       HtlcStateSettled,
+		},
+	}
 
 	// We should get back the exact same invoice that we just inserted.
 	if !reflect.DeepEqual(dbInvoice, invoice) {
@@ -360,7 +379,9 @@ func TestDuplicateSettleInvoice(t *testing.T) {
 
 	// If we try to settle the invoice again, then we should get the very
 	// same invoice back, but with an error this time.
-	dbInvoice, err = db.SettleInvoice(payHash, amt)
+	dbInvoice, err = db.UpdateInvoice(
+		payHash, getUpdateInvoice(amt),
+	)
 	if err != ErrInvoiceAlreadySettled {
 		t.Fatalf("expected ErrInvoiceAlreadySettled")
 	}
@@ -397,14 +418,18 @@ func TestQueryInvoices(t *testing.T) {
 			t.Fatalf("unable to create invoice: %v", err)
 		}
 
-		if _, err := db.AddInvoice(invoice); err != nil {
+		paymentHash := invoice.Terms.PaymentPreimage.Hash()
+
+		if _, err := db.AddInvoice(invoice, paymentHash); err != nil {
 			t.Fatalf("unable to add invoice: %v", err)
 		}
 
 		// We'll only settle half of all invoices created.
 		if i%2 == 0 {
-			paymentHash := sha256.Sum256(invoice.Terms.PaymentPreimage[:])
-			if _, err := db.SettleInvoice(paymentHash, i); err != nil {
+			_, err := db.UpdateInvoice(
+				paymentHash, getUpdateInvoice(i),
+			)
+			if err != nil {
 				t.Fatalf("unable to settle invoice: %v", err)
 			}
 		}
@@ -643,5 +668,27 @@ func TestQueryInvoices(t *testing.T) {
 				spew.Sdump(response.Invoices),
 				spew.Sdump(testCase.expected))
 		}
+	}
+}
+
+// getUpdateInvoice returns an invoice update callback that, when called,
+// settles the invoice with the given amount.
+func getUpdateInvoice(amt lnwire.MilliSatoshi) InvoiceUpdateCallback {
+	return func(invoice *Invoice) (*InvoiceUpdateDesc, error) {
+		if invoice.Terms.State == ContractSettled {
+			return nil, ErrInvoiceAlreadySettled
+		}
+
+		update := &InvoiceUpdateDesc{
+			Preimage: invoice.Terms.PaymentPreimage,
+			State:    ContractSettled,
+			Htlcs: map[CircuitKey]*HtlcAcceptDesc{
+				{}: {
+					Amt: amt,
+				},
+			},
+		}
+
+		return update, nil
 	}
 }

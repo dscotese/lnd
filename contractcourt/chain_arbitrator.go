@@ -12,7 +12,6 @@ import (
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/input"
-	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/sweep"
@@ -35,7 +34,7 @@ type ResolutionMsg struct {
 	// commitment trace.
 	HtlcIndex uint64
 
-	// Failure will be non-nil if the incoming contract should be cancelled
+	// Failure will be non-nil if the incoming contract should be canceled
 	// all together. This can happen if the outgoing contract was dust, if
 	// if the outgoing HTLC timed out.
 	Failure lnwire.FailureMessage
@@ -53,13 +52,20 @@ type ChainArbitratorConfig struct {
 	// ChainHash is the chain that this arbitrator is to operate within.
 	ChainHash chainhash.Hash
 
-	// BroadcastDelta is the delta that we'll use to decide when to
-	// broadcast our commitment transaction.  This value should be set
-	// based on our current fee estimation of the commitment transaction.
-	// We use this to determine when we should broadcast instead of the
-	// just the HTLC timeout, as we want to ensure that the commitment
-	// transaction is already confirmed, by the time the HTLC expires.
-	BroadcastDelta uint32
+	// IncomingBroadcastDelta is the delta that we'll use to decide when to
+	// broadcast our commitment transaction if we have incoming htlcs. This
+	// value should be set based on our current fee estimation of the
+	// commitment transaction. We use this to determine when we should
+	// broadcast instead of the just the HTLC timeout, as we want to ensure
+	// that the commitment transaction is already confirmed, by the time the
+	// HTLC expires. Otherwise we may end up not settling the htlc on-chain
+	// because the other party managed to time it out.
+	IncomingBroadcastDelta uint32
+
+	// OutgoingBroadcastDelta is the delta that we'll use to decide when to
+	// broadcast our commitment transaction if there are active outgoing
+	// htlcs. This value can be lower than the incoming broadcast delta.
+	OutgoingBroadcastDelta uint32
 
 	// NewSweepAddr is a function that returns a new address under control
 	// by the wallet. We'll use this to sweep any no-delay outputs as a
@@ -137,10 +143,9 @@ type ChainArbitratorConfig struct {
 	// Sweeper allows resolvers to sweep their final outputs.
 	Sweeper *sweep.UtxoSweeper
 
-	// SettleInvoice attempts to settle an existing invoice on-chain with
-	// the given payment hash. ErrInvoiceNotFound is returned if an invoice
-	// is not found.
-	SettleInvoice func(lntypes.Hash, lnwire.MilliSatoshi) error
+	// Registry is the invoice database that is used by resolvers to lookup
+	// preimages and settle invoices.
+	Registry Registry
 
 	// NotifyClosedChannel is a function closure that the ChainArbitrator
 	// will use to notify the ChannelNotifier about a newly closed channel.
@@ -227,25 +232,37 @@ func newActiveChannelArbitrator(channel *channeldb.OpenChannel,
 		ShortChanID: channel.ShortChanID(),
 		BlockEpochs: blockEpoch,
 		ForceCloseChan: func() (*lnwallet.LocalForceCloseSummary, error) {
-			// With the channels fetched, attempt to locate
-			// the target channel according to its channel
-			// point.
+			// First, we mark the channel as borked, this ensure
+			// that no new state transitions can happen, and also
+			// that the link won't be loaded into the switch.
+			if err := channel.MarkBorked(); err != nil {
+				return nil, err
+			}
+
+			// With the channel marked as borked, we'll now remove
+			// the link from the switch if its there. If the link
+			// is active, then this method will block until it
+			// exits.
+			if err := c.cfg.MarkLinkInactive(chanPoint); err != nil {
+				log.Errorf("unable to mark link inactive: %v", err)
+			}
+
+			// Now that we know the link can't mutate the channel
+			// state, we'll read the channel from disk the target
+			// channel according to its channel point.
 			channel, err := c.chanSource.FetchChannel(chanPoint)
 			if err != nil {
 				return nil, err
 			}
 
+			// Finally, we'll force close the channel completing
+			// the force close workflow.
 			chanMachine, err := lnwallet.NewLightningChannel(
-				c.cfg.Signer, c.cfg.PreimageDB, channel, nil,
+				c.cfg.Signer, channel, nil,
 			)
 			if err != nil {
 				return nil, err
 			}
-
-			if err := c.cfg.MarkLinkInactive(chanPoint); err != nil {
-				log.Errorf("unable to mark link inactive: %v", err)
-			}
-
 			return chanMachine.ForceClose()
 		},
 		MarkCommitmentBroadcasted: channel.MarkCommitmentBroadcasted,
@@ -279,8 +296,25 @@ func newActiveChannelArbitrator(channel *channeldb.OpenChannel,
 		return c.resolveContract(chanPoint, chanLog)
 	}
 
+	// Finally, we'll need to construct a series of htlc Sets based on all
+	// currently known valid commitments.
+	htlcSets := make(map[HtlcSetKey]htlcSet)
+	htlcSets[LocalHtlcSet] = newHtlcSet(channel.LocalCommitment.Htlcs)
+	htlcSets[RemoteHtlcSet] = newHtlcSet(channel.RemoteCommitment.Htlcs)
+
+	pendingRemoteCommitment, err := channel.RemoteCommitChainTip()
+	if err != nil && err != channeldb.ErrNoPendingCommit {
+		blockEpoch.Cancel()
+		return nil, err
+	}
+	if pendingRemoteCommitment != nil {
+		htlcSets[RemotePendingHtlcSet] = newHtlcSet(
+			pendingRemoteCommitment.Commitment.Htlcs,
+		)
+	}
+
 	return NewChannelArbitrator(
-		arbCfg, channel.LocalCommitment.Htlcs, chanLog,
+		arbCfg, htlcSets, chanLog,
 	), nil
 }
 
@@ -357,12 +391,12 @@ func (c *ChainArbitrator) Start() error {
 			chainWatcherConfig{
 				chanState: channel,
 				notifier:  c.cfg.Notifier,
-				pCache:    c.cfg.PreimageDB,
 				signer:    c.cfg.Signer,
 				isOurAddr: c.cfg.IsOurAddress,
 				contractBreach: func(retInfo *lnwallet.BreachRetribution) error {
 					return c.cfg.ContractBreach(chanPoint, retInfo)
 				},
+				extractStateNumHint: lnwallet.GetStateNumHint,
 			},
 		)
 		if err != nil {
@@ -378,6 +412,36 @@ func (c *ChainArbitrator) Start() error {
 		}
 
 		c.activeChannels[chanPoint] = channelArb
+
+		// If the channel has had its commitment broadcasted already,
+		// republish it in case it didn't propagate.
+		if !channel.HasChanStatus(
+			channeldb.ChanStatusCommitBroadcasted,
+		) {
+			continue
+		}
+
+		closeTx, err := channel.BroadcastedCommitment()
+		switch {
+
+		// This can happen for channels that had their closing tx
+		// published before we started storing it to disk.
+		case err == channeldb.ErrNoCloseTx:
+			log.Warnf("Channel %v is in state CommitBroadcasted, "+
+				"but no closing tx to re-publish...", chanPoint)
+			continue
+
+		case err != nil:
+			return err
+		}
+
+		log.Infof("Re-publishing closing tx(%v) for channel %v",
+			closeTx.TxHash(), chanPoint)
+		err = c.cfg.PublishTx(closeTx)
+		if err != nil && err != lnwallet.ErrDoubleSpend {
+			log.Warnf("Unable to broadcast close tx(%v): %v",
+				closeTx.TxHash(), err)
+		}
 	}
 
 	// In addition to the channels that we know to be open, we'll also
@@ -429,7 +493,7 @@ func (c *ChainArbitrator) Start() error {
 
 		// We can also leave off the set of HTLC's here as since the
 		// channel is already in the process of being full resolved, no
-		// new HTLC's we be added.
+		// new HTLC's will be added.
 		c.activeChannels[chanPoint] = NewChannelArbitrator(
 			arbCfg, nil, chanLog,
 		)
@@ -540,15 +604,27 @@ func (c *ChainArbitrator) Stop() error {
 	return nil
 }
 
+// ContractUpdate is a message packages the latest set of active HTLCs on a
+// commitment, and also identifies which commitment received a new set of
+// HTLCs.
+type ContractUpdate struct {
+	// HtlcKey identifies which commitment the HTLCs below are present on.
+	HtlcKey HtlcSetKey
+
+	// Htlcs are the of active HTLCs on the commitment identified by the
+	// above HtlcKey.
+	Htlcs []channeldb.HTLC
+}
+
 // ContractSignals wraps the two signals that affect the state of a channel
 // being watched by an arbitrator. The two signals we care about are: the
 // channel has a new set of HTLC's, and the remote party has just broadcast
 // their version of the commitment transaction.
 type ContractSignals struct {
-	// HtlcUpdates is a channel that once we new commitment updates takes
-	// place, the later set of HTLC's on the commitment transaction should
-	// be sent over.
-	HtlcUpdates chan []channeldb.HTLC
+	// HtlcUpdates is a channel that the link will use to update the
+	// designated channel arbitrator when the set of HTLCs on any valid
+	// commitment changes.
+	HtlcUpdates chan *ContractUpdate
 
 	// ShortChanID is the up to date short channel ID for a contract. This
 	// can change either if when the contract was added it didn't yet have
@@ -623,6 +699,14 @@ func (c *ChainArbitrator) ForceCloseContract(chanPoint wire.OutPoint) (*wire.Msg
 
 	log.Infof("Attempting to force close ChannelPoint(%v)", chanPoint)
 
+	// Before closing, we'll attempt to send a disable update for the
+	// channel. We do so before closing the channel as otherwise the current
+	// edge policy won't be retrievable from the graph.
+	if err := c.cfg.DisableChannel(chanPoint); err != nil {
+		log.Warnf("Unable to disable channel %v on "+
+			"close: %v", chanPoint, err)
+	}
+
 	errChan := make(chan error, 1)
 	respChan := make(chan *wire.MsgTx, 1)
 
@@ -655,16 +739,6 @@ func (c *ChainArbitrator) ForceCloseContract(chanPoint wire.OutPoint) (*wire.Msg
 		return nil, ErrChainArbExiting
 	}
 
-	// We'll attempt to disable the channel in the background to
-	// avoid blocking due to sending the update message to all
-	// active peers.
-	go func() {
-		if err := c.cfg.DisableChannel(chanPoint); err != nil {
-			log.Errorf("Unable to disable channel %v on "+
-				"close: %v", chanPoint, err)
-		}
-	}()
-
 	return closeTx, nil
 }
 
@@ -692,12 +766,12 @@ func (c *ChainArbitrator) WatchNewChannel(newChan *channeldb.OpenChannel) error 
 		chainWatcherConfig{
 			chanState: newChan,
 			notifier:  c.cfg.Notifier,
-			pCache:    c.cfg.PreimageDB,
 			signer:    c.cfg.Signer,
 			isOurAddr: c.cfg.IsOurAddress,
 			contractBreach: func(retInfo *lnwallet.BreachRetribution) error {
 				return c.cfg.ContractBreach(chanPoint, retInfo)
 			},
+			extractStateNumHint: lnwallet.GetStateNumHint,
 		},
 	)
 	if err != nil {

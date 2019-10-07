@@ -1,13 +1,15 @@
 package contractcourt
 
 import (
-	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"io"
 
+	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/invoices"
+
 	"github.com/btcsuite/btcutil"
+	"github.com/lightningnetwork/lnd/lntypes"
 )
 
 // htlcIncomingContestResolver is a ContractResolver that's able to resolve an
@@ -23,6 +25,9 @@ type htlcIncomingContestResolver struct {
 	// before we learn of the preimage then we can't claim it on chain
 	// successfully.
 	htlcExpiry uint32
+
+	// circuitKey describes the incoming htlc that is being resolved.
+	circuitKey channeldb.CircuitKey
 
 	// htlcSuccessResolver is the inner resolver that may be utilized if we
 	// learn of the preimage.
@@ -48,15 +53,32 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 		return nil, nil
 	}
 
-	// We'll first check if this HTLC has been timed out, if so, we can
-	// return now and mark ourselves as resolved.
-	_, currentHeight, err := h.ChainIO.GetBestBlock()
+	// Register for block epochs. After registration, the current height
+	// will be sent on the channel immediately.
+	blockEpochs, err := h.Notifier.RegisterBlockEpochNtfn(nil)
 	if err != nil {
 		return nil, err
 	}
+	defer blockEpochs.Cancel()
 
-	// If we're past the point of expiry of the HTLC, then at this point
-	// the sender can sweep it, so we'll end our lifetime.
+	var currentHeight int32
+	select {
+	case newBlock, ok := <-blockEpochs.Epochs:
+		if !ok {
+			return nil, errResolverShuttingDown
+		}
+		currentHeight = newBlock.Height
+	case <-h.Quit:
+		return nil, errResolverShuttingDown
+	}
+
+	// We'll first check if this HTLC has been timed out, if so, we can
+	// return now and mark ourselves as resolved. If we're past the point of
+	// expiry of the HTLC, then at this point the sender can sweep it, so
+	// we'll end our lifetime. Here we deliberately forego the chance that
+	// the sender doesn't sweep and we already have or will learn the
+	// preimage. Otherwise the resolver could potentially stay active
+	// indefinitely and the channel will never close properly.
 	if uint32(currentHeight) >= h.htlcExpiry {
 		// TODO(roasbeef): should also somehow check if outgoing is
 		// resolved or not
@@ -70,15 +92,23 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 		return nil, h.Checkpoint(h)
 	}
 
-	// applyPreimage is a helper function that will populate our internal
+	// tryApplyPreimage is a helper function that will populate our internal
 	// resolver with the preimage we learn of. This should be called once
 	// the preimage is revealed so the inner resolver can properly complete
-	// its duties.
-	applyPreimage := func(preimage []byte) {
-		copy(h.htlcResolution.Preimage[:], preimage)
+	// its duties. The boolean return value indicates whether the preimage
+	// was properly applied.
+	applyPreimage := func(preimage lntypes.Preimage) error {
+		// Sanity check to see if this preimage matches our htlc. At
+		// this point it should never happen that it does not match.
+		if !preimage.Matches(h.payHash) {
+			return errors.New("preimage does not match hash")
+		}
 
-		log.Infof("%T(%v): extracted preimage=%x from beacon!", h,
-			h.htlcResolution.ClaimOutpoint, preimage[:])
+		// Update htlcResolution with the matching preimage.
+		h.htlcResolution.Preimage = preimage
+
+		log.Infof("%T(%v): extracted preimage=%v from beacon!", h,
+			h.htlcResolution.ClaimOutpoint, preimage)
 
 		// If this our commitment transaction, then we'll need to
 		// populate the witness for the second-level HTLC transaction.
@@ -94,7 +124,7 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 			h.htlcResolution.SignedSuccessTx.TxIn[0].Witness[3] = preimage[:]
 		}
 
-		copy(h.htlcResolution.Preimage[:], preimage[:])
+		return nil
 	}
 
 	// If the HTLC hasn't expired yet, then we may still be able to claim
@@ -105,23 +135,65 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 	// ensure the preimage can't be delivered between querying and
 	// registering for the preimage subscription.
 	preimageSubscription := h.PreimageDB.SubscribeUpdates()
-	blockEpochs, err := h.Notifier.RegisterBlockEpochNtfn(nil)
-	if err != nil {
+	defer preimageSubscription.CancelSubscription()
+
+	// Define closure to process hodl events either direct or triggered by
+	// later notifcation.
+	processHodlEvent := func(e invoices.HodlEvent) (ContractResolver,
+		error) {
+
+		if e.Preimage == nil {
+			log.Infof("%T(%v): Exit hop HTLC canceled "+
+				"(expiry=%v, height=%v), abandoning", h,
+				h.htlcResolution.ClaimOutpoint,
+				h.htlcExpiry, currentHeight)
+
+			h.resolved = true
+			return nil, h.Checkpoint(h)
+		}
+
+		if err := applyPreimage(*e.Preimage); err != nil {
+			return nil, err
+		}
+
+		return &h.htlcSuccessResolver, nil
+	}
+
+	// Create a buffered hodl chan to prevent deadlock.
+	hodlChan := make(chan interface{}, 1)
+
+	// Notify registry that we are potentially resolving as an exit hop
+	// on-chain. If this HTLC indeed pays to an existing invoice, the
+	// invoice registry will tell us what to do with the HTLC. This is
+	// identical to HTLC resolution in the link.
+	event, err := h.Registry.NotifyExitHopHtlc(
+		h.payHash, h.htlcAmt, h.htlcExpiry, currentHeight,
+		h.circuitKey, hodlChan, nil,
+	)
+	switch err {
+	case channeldb.ErrInvoiceNotFound:
+	case nil:
+		defer h.Registry.HodlUnsubscribeAll(hodlChan)
+
+		// Resolve the htlc directly if possible.
+		if event != nil {
+			return processHodlEvent(*event)
+		}
+	default:
 		return nil, err
 	}
-	defer func() {
-		preimageSubscription.CancelSubscription()
-		blockEpochs.Cancel()
-	}()
 
 	// With the epochs and preimage subscriptions initialized, we'll query
 	// to see if we already know the preimage.
-	preimage, ok := h.PreimageDB.LookupPreimage(h.payHash[:])
+	preimage, ok := h.PreimageDB.LookupPreimage(h.payHash)
 	if ok {
 		// If we do, then this means we can claim the HTLC!  However,
 		// we don't know how to ourselves, so we'll return our inner
 		// resolver which has the knowledge to do so.
-		applyPreimage(preimage[:])
+		if err := applyPreimage(preimage); err != nil {
+			return nil, err
+		}
+
 		return &h.htlcSuccessResolver, nil
 	}
 
@@ -129,29 +201,34 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 
 		select {
 		case preimage := <-preimageSubscription.WitnessUpdates:
-			// If this isn't our preimage, then we'll continue
-			// onwards.
-			newHash := sha256.Sum256(preimage)
-			preimageMatches := bytes.Equal(newHash[:], h.payHash[:])
-			if !preimageMatches {
+			// We receive all new preimages, so we need to ignore
+			// all except the preimage we are waiting for.
+			if !preimage.Matches(h.payHash) {
 				continue
 			}
 
-			// Otherwise, we've learned of the preimage! We'll add
-			// this information to our inner resolver, then return
-			// it so it can continue contract resolution.
-			applyPreimage(preimage)
+			if err := applyPreimage(preimage); err != nil {
+				return nil, err
+			}
+
+			// We've learned of the preimage and this information
+			// has been added to our inner resolver. We return it so
+			// it can continue contract resolution.
 			return &h.htlcSuccessResolver, nil
+
+		case hodlItem := <-hodlChan:
+			hodlEvent := hodlItem.(invoices.HodlEvent)
+
+			return processHodlEvent(hodlEvent)
 
 		case newBlock, ok := <-blockEpochs.Epochs:
 			if !ok {
-				return nil, fmt.Errorf("quitting")
+				return nil, errResolverShuttingDown
 			}
 
 			// If this new height expires the HTLC, then this means
 			// we never found out the preimage, so we can mark
-			// resolved and
-			// exit.
+			// resolved and exit.
 			newHeight := uint32(newBlock.Height)
 			if newHeight >= h.htlcExpiry {
 				log.Infof("%T(%v): HTLC has timed out "+
@@ -163,7 +240,7 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 			}
 
 		case <-h.Quit:
-			return nil, fmt.Errorf("resolver stopped")
+			return nil, errResolverShuttingDown
 		}
 	}
 }

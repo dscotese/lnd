@@ -56,7 +56,7 @@ func (c *ChannelContribution) toChanConfig() channeldb.ChannelConfig {
 // reservation workflow, resources consumed by a contribution are "locked"
 // themselves. This prevents a number of race conditions such as two funding
 // transactions double-spending the same input. A reservation can also be
-// cancelled, which removes the resources from limbo, allowing another
+// canceled, which removes the resources from limbo, allowing another
 // reservation to claim them.
 //
 // The reservation workflow consists of the following three steps:
@@ -127,10 +127,11 @@ type ChannelReservation struct {
 // used only internally by lnwallet. In order to concurrent safety, the
 // creation of all channel reservations should be carried out via the
 // lnwallet.InitChannelReservation interface.
-func NewChannelReservation(capacity, fundingAmt btcutil.Amount,
+func NewChannelReservation(capacity, localFundingAmt btcutil.Amount,
 	commitFeePerKw SatPerKWeight, wallet *LightningWallet,
 	id uint64, pushMSat lnwire.MilliSatoshi, chainHash *chainhash.Hash,
-	flags lnwire.FundingFlag) (*ChannelReservation, error) {
+	flags lnwire.FundingFlag,
+	tweaklessCommit bool) (*ChannelReservation, error) {
 
 	var (
 		ourBalance   lnwire.MilliSatoshi
@@ -139,14 +140,16 @@ func NewChannelReservation(capacity, fundingAmt btcutil.Amount,
 	)
 
 	commitFee := commitFeePerKw.FeeForWeight(input.CommitWeight)
-	fundingMSat := lnwire.NewMSatFromSatoshis(fundingAmt)
+	localFundingMSat := lnwire.NewMSatFromSatoshis(localFundingAmt)
+	// TODO(halseth): make method take remote funding amount directly
+	// instead of inferring it from capacity and local amt.
 	capacityMSat := lnwire.NewMSatFromSatoshis(capacity)
 	feeMSat := lnwire.NewMSatFromSatoshis(commitFee)
 
 	// If we're the responder to a single-funder reservation, then we have
 	// no initial balance in the channel unless the remote party is pushing
 	// some funds to us within the first commitment state.
-	if fundingAmt == 0 {
+	if localFundingAmt == 0 {
 		ourBalance = pushMSat
 		theirBalance = capacityMSat - feeMSat - pushMSat
 		initiator = false
@@ -163,7 +166,7 @@ func NewChannelReservation(capacity, fundingAmt btcutil.Amount,
 		// TODO(roasbeef): need to rework fee structure in general and
 		// also when we "unlock" dual funder within the daemon
 
-		if capacity == fundingAmt {
+		if capacity == localFundingAmt {
 			// If we're initiating a single funder workflow, then
 			// we pay all the initial fees within the commitment
 			// transaction. We also deduct our balance by the
@@ -174,8 +177,8 @@ func NewChannelReservation(capacity, fundingAmt btcutil.Amount,
 			// Otherwise, this is a dual funder workflow where both
 			// slides split the amount funded and the commitment
 			// fee.
-			ourBalance = fundingMSat - (feeMSat / 2)
-			theirBalance = capacityMSat - fundingMSat - (feeMSat / 2) + pushMSat
+			ourBalance = localFundingMSat - (feeMSat / 2)
+			theirBalance = capacityMSat - localFundingMSat - (feeMSat / 2) + pushMSat
 		}
 
 		initiator = true
@@ -211,7 +214,11 @@ func NewChannelReservation(capacity, fundingAmt btcutil.Amount,
 	// non-zero push amt (there's no pushing for dual funder), then this is
 	// a single-funder channel.
 	if ourBalance == 0 || theirBalance == 0 || pushMSat != 0 {
-		chanType = channeldb.SingleFunder
+		if tweaklessCommit {
+			chanType = channeldb.SingleFunderTweakless
+		} else {
+			chanType = channeldb.SingleFunder
+		}
 	} else {
 		// Otherwise, this is a dual funder channel, and no side is
 		// technically the "initiator"
@@ -286,8 +293,8 @@ func (r *ChannelReservation) CommitConstraints(c *channeldb.ChannelConstraints) 
 		return ErrCsvDelayTooLarge(c.CsvDelay, maxDelay)
 	}
 
-	// The dust limit should always be greater or equal to the channel
-	// reserve. The reservation request should be denied if otherwise.
+	// The channel reserve should always be greater or equal to the dust
+	// limit. The reservation request should be denied if otherwise.
 	if c.DustLimit > c.ChanReserve {
 		return ErrChanReserveTooSmall(c.ChanReserve, c.DustLimit)
 	}
@@ -427,7 +434,7 @@ func (r *ChannelReservation) OurSignatures() ([]*input.Script, []byte) {
 // https://github.com/bitcoin/bips/blob/master/bip-0069.mediawiki.
 // Additionally, verification is performed in order to ensure that the
 // counterparty supplied a valid signature to our version of the commitment
-// transaction.  Once this method returns, caller's should broadcast the
+// transaction.  Once this method returns, callers should broadcast the
 // created funding transaction, then call .WaitForChannelOpen() which will
 // block until the funding transaction obtains the configured number of
 // confirmations. Once the method unblocks, a LightningChannel instance is
@@ -511,6 +518,13 @@ func (r *ChannelReservation) FundingOutpoint() *wire.OutPoint {
 	r.RLock()
 	defer r.RUnlock()
 	return &r.partialState.FundingOutpoint
+}
+
+// Capacity returns the channel capacity for this reservation.
+func (r *ChannelReservation) Capacity() btcutil.Amount {
+	r.RLock()
+	defer r.RUnlock()
+	return r.partialState.Capacity
 }
 
 // Cancel abandons this channel reservation. This method should be called in

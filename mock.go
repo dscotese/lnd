@@ -1,7 +1,6 @@
-package main
+package lnd
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -12,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
+	"github.com/btcsuite/btcwallet/wallet/txauthor"
 
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/input"
@@ -122,6 +122,7 @@ func (m *mockNotfier) RegisterSpendNtfn(outpoint *wire.OutPoint, _ []byte,
 type mockSpendNotifier struct {
 	*mockNotfier
 	spendMap map[wire.OutPoint][]chan *chainntnfs.SpendDetail
+	spends   map[wire.OutPoint]*chainntnfs.SpendDetail
 	mtx      sync.Mutex
 }
 
@@ -131,6 +132,7 @@ func makeMockSpendNotifier() *mockSpendNotifier {
 			confChannel: make(chan *chainntnfs.TxConfirmation),
 		},
 		spendMap: make(map[wire.OutPoint][]chan *chainntnfs.SpendDetail),
+		spends:   make(map[wire.OutPoint]*chainntnfs.SpendDetail),
 	}
 }
 
@@ -139,8 +141,22 @@ func (m *mockSpendNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint,
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
-	spendChan := make(chan *chainntnfs.SpendDetail)
-	m.spendMap[*outpoint] = append(m.spendMap[*outpoint], spendChan)
+	spendChan := make(chan *chainntnfs.SpendDetail, 1)
+	if detail, ok := m.spends[*outpoint]; ok {
+		// Deliver spend immediately if details are already known.
+		spendChan <- &chainntnfs.SpendDetail{
+			SpentOutPoint:     detail.SpentOutPoint,
+			SpendingHeight:    detail.SpendingHeight,
+			SpendingTx:        detail.SpendingTx,
+			SpenderTxHash:     detail.SpenderTxHash,
+			SpenderInputIndex: detail.SpenderInputIndex,
+		}
+	} else {
+		// Otherwise, queue the notification for delivery if the spend
+		// is ever received.
+		m.spendMap[*outpoint] = append(m.spendMap[*outpoint], spendChan)
+	}
+
 	return &chainntnfs.SpendEvent{
 		Spend: spendChan,
 		Cancel: func() {
@@ -155,16 +171,30 @@ func (m *mockSpendNotifier) Spend(outpoint *wire.OutPoint, height int32,
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
+	txnHash := txn.TxHash()
+	details := &chainntnfs.SpendDetail{
+		SpentOutPoint:     outpoint,
+		SpendingHeight:    height,
+		SpendingTx:        txn,
+		SpenderTxHash:     &txnHash,
+		SpenderInputIndex: outpoint.Index,
+	}
+
+	// Cache details in case of late registration.
+	if _, ok := m.spends[*outpoint]; !ok {
+		m.spends[*outpoint] = details
+	}
+
+	// Deliver any backlogged spend notifications.
 	if spendChans, ok := m.spendMap[*outpoint]; ok {
 		delete(m.spendMap, *outpoint)
 		for _, spendChan := range spendChans {
-			txnHash := txn.TxHash()
 			spendChan <- &chainntnfs.SpendDetail{
-				SpentOutPoint:     outpoint,
-				SpendingHeight:    height,
-				SpendingTx:        txn,
-				SpenderTxHash:     &txnHash,
-				SpenderInputIndex: outpoint.Index,
+				SpentOutPoint:     details.SpentOutPoint,
+				SpendingHeight:    details.SpendingHeight,
+				SpendingTx:        details.SpendingTx,
+				SpenderTxHash:     details.SpenderTxHash,
+				SpenderInputIndex: details.SpenderInputIndex,
 			}
 		}
 	}
@@ -174,12 +204,14 @@ type mockChainIO struct {
 	bestHeight int32
 }
 
+var _ lnwallet.BlockChainIO = (*mockChainIO)(nil)
+
 func (m *mockChainIO) GetBestBlock() (*chainhash.Hash, int32, error) {
 	return activeNetParams.GenesisHash, m.bestHeight, nil
 }
 
 func (*mockChainIO) GetUtxo(op *wire.OutPoint, _ []byte,
-	heightHint uint32) (*wire.TxOut, error) {
+	heightHint uint32, _ <-chan struct{}) (*wire.TxOut, error) {
 	return nil, nil
 }
 
@@ -195,9 +227,9 @@ func (*mockChainIO) GetBlock(blockHash *chainhash.Hash) (*wire.MsgBlock, error) 
 // interaction with the bitcoin network.
 type mockWalletController struct {
 	rootKey               *btcec.PrivateKey
-	prevAddres            btcutil.Address
 	publishedTransactions chan *wire.MsgTx
 	index                 uint32
+	utxos                 []*lnwallet.Utxo
 }
 
 // BackEnd returns "mock" to signify a mock wallet controller.
@@ -208,12 +240,15 @@ func (*mockWalletController) BackEnd() string {
 // FetchInputInfo will be called to get info about the inputs to the funding
 // transaction.
 func (*mockWalletController) FetchInputInfo(
-	prevOut *wire.OutPoint) (*wire.TxOut, error) {
-	txOut := &wire.TxOut{
-		Value:    int64(10 * btcutil.SatoshiPerBitcoin),
-		PkScript: []byte("dummy"),
+	prevOut *wire.OutPoint) (*lnwallet.Utxo, error) {
+	utxo := &lnwallet.Utxo{
+		AddressType:   lnwallet.WitnessPubKey,
+		Value:         10 * btcutil.SatoshiPerBitcoin,
+		PkScript:      []byte("dummy"),
+		Confirmations: 1,
+		OutPoint:      *prevOut,
 	}
-	return txOut, nil
+	return utxo, nil
 }
 func (*mockWalletController) ConfirmedBalance(confs int32) (btcutil.Amount, error) {
 	return 0, nil
@@ -226,6 +261,11 @@ func (m *mockWalletController) NewAddress(addrType lnwallet.AddressType,
 		m.rootKey.PubKey().SerializeCompressed(), &chaincfg.MainNetParams)
 	return addr, nil
 }
+func (*mockWalletController) LastUnusedAddress(addrType lnwallet.AddressType) (
+	btcutil.Address, error) {
+	return nil, nil
+}
+
 func (*mockWalletController) IsOurAddress(a btcutil.Address) bool {
 	return false
 }
@@ -236,10 +276,23 @@ func (*mockWalletController) SendOutputs(outputs []*wire.TxOut,
 	return nil, nil
 }
 
+func (*mockWalletController) CreateSimpleTx(outputs []*wire.TxOut,
+	_ lnwallet.SatPerKWeight, _ bool) (*txauthor.AuthoredTx, error) {
+
+	return nil, nil
+}
+
 // ListUnspentWitness is called by the wallet when doing coin selection. We just
 // need one unspent for the funding transaction.
 func (m *mockWalletController) ListUnspentWitness(minconfirms,
 	maxconfirms int32) ([]*lnwallet.Utxo, error) {
+
+	// If the mock already has a list of utxos, return it.
+	if m.utxos != nil {
+		return m.utxos, nil
+	}
+
+	// Otherwise create one to return.
 	utxo := &lnwallet.Utxo{
 		AddressType: lnwallet.WitnessPubKey,
 		Value:       btcutil.Amount(10 * btcutil.SatoshiPerBitcoin),
@@ -299,29 +352,4 @@ func (m *mockSecretKeyRing) DerivePrivKey(keyDesc keychain.KeyDescriptor) (*btce
 func (m *mockSecretKeyRing) ScalarMult(keyDesc keychain.KeyDescriptor,
 	pubKey *btcec.PublicKey) ([]byte, error) {
 	return nil, nil
-}
-
-type mockPreimageCache struct {
-	sync.Mutex
-	preimageMap map[[32]byte][]byte
-}
-
-func (m *mockPreimageCache) LookupPreimage(hash []byte) ([]byte, bool) {
-	m.Lock()
-	defer m.Unlock()
-
-	var h [32]byte
-	copy(h[:], hash)
-
-	p, ok := m.preimageMap[h]
-	return p, ok
-}
-
-func (m *mockPreimageCache) AddPreimage(preimage []byte) error {
-	m.Lock()
-	defer m.Unlock()
-
-	m.preimageMap[sha256.Sum256(preimage[:])] = preimage
-
-	return nil
 }

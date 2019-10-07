@@ -1,6 +1,9 @@
 package channeldb
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 var (
 	// ErrNoChanDBExists is returned when a channel bucket hasn't been
@@ -10,6 +13,10 @@ var (
 	// ErrDBReversion is returned when detecting an attempt to revert to a
 	// prior database version.
 	ErrDBReversion = fmt.Errorf("channel db cannot revert to prior version")
+
+	// ErrDBVersionTooLow is returned when detecting an attempt to upgrade a
+	// version for which migration is no longer supported.
+	ErrDBVersionTooLow = fmt.Errorf("channel db version too old to upgrade")
 
 	// ErrLinkNodesNotFound is returned when node info bucket hasn't been
 	// created.
@@ -78,6 +85,10 @@ var (
 	// ErrEdgeNotFound is returned when an edge for the target chanID
 	// can't be found.
 	ErrEdgeNotFound = fmt.Errorf("edge not found")
+
+	// ErrZombieEdge is an error returned when we attempt to look up an edge
+	// but it is marked as a zombie within the zombie index.
+	ErrZombieEdge = errors.New("edge marked as zombie")
 
 	// ErrEdgeAlreadyExist is returned when edge with specific
 	// channel id can't be added because it already exist.

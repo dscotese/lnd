@@ -1,4 +1,4 @@
-FROM golang:1.11-alpine as builder
+FROM golang:1.13-alpine as builder
 
 MAINTAINER Olaoluwa Osuntokun <lightning.engineering>
 
@@ -15,7 +15,7 @@ RUN apk add --no-cache --update alpine-sdk \
     make \
 &&  cd /go/src/github.com/lightningnetwork/lnd \
 &&  make \
-&&  make install
+&&  make install tags="signrpc walletrpc chainrpc invoicesrpc routerrpc"
 
 # Start a new, final image to reduce size.
 FROM alpine as final

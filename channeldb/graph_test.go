@@ -29,9 +29,7 @@ var (
 		"[2001:db8:85a3:0:0:8a2e:370:7334]:80")
 	testAddrs = []net.Addr{testAddr, anotherAddr}
 
-	randSource = prand.NewSource(time.Now().Unix())
-	randInts   = prand.New(randSource)
-	testSig    = &btcec.Signature{
+	testSig = &btcec.Signature{
 		R: new(big.Int),
 		S: new(big.Int),
 	}
@@ -41,13 +39,8 @@ var (
 	testFeatures = lnwire.NewFeatureVector(nil, lnwire.GlobalFeatures)
 )
 
-func createTestVertex(db *DB) (*LightningNode, error) {
+func createLightningNode(db *DB, priv *btcec.PrivateKey) (*LightningNode, error) {
 	updateTime := prand.Int63()
-
-	priv, err := btcec.NewPrivateKey(btcec.S256())
-	if err != nil {
-		return nil, err
-	}
 
 	pub := priv.PubKey().SerializeCompressed()
 	n := &LightningNode{
@@ -63,6 +56,15 @@ func createTestVertex(db *DB) (*LightningNode, error) {
 	copy(n.PubKeyBytes[:], priv.PubKey().SerializeCompressed())
 
 	return n, nil
+}
+
+func createTestVertex(db *DB) (*LightningNode, error) {
+	priv, err := btcec.NewPrivateKey(btcec.S256())
+	if err != nil {
+		return nil, err
+	}
+
+	return createLightningNode(db, priv)
 }
 
 func TestNodeInsertionAndDeletion(t *testing.T) {
@@ -362,7 +364,7 @@ func TestEdgeInsertionDeletion(t *testing.T) {
 
 	// Next, attempt to delete the edge from the database, again this
 	// should proceed without any issues.
-	if err := graph.DeleteChannelEdge(&outpoint); err != nil {
+	if err := graph.DeleteChannelEdges(chanID); err != nil {
 		t.Fatalf("unable to delete edge: %v", err)
 	}
 
@@ -374,10 +376,14 @@ func TestEdgeInsertionDeletion(t *testing.T) {
 	if _, _, _, err := graph.FetchChannelEdgesByID(chanID); err == nil {
 		t.Fatalf("channel edge not deleted")
 	}
+	isZombie, _, _ := graph.IsZombieEdge(chanID)
+	if !isZombie {
+		t.Fatal("channel edge not marked as zombie")
+	}
 
 	// Finally, attempt to delete a (now) non-existent edge within the
 	// database, this should result in an error.
-	err = graph.DeleteChannelEdge(&outpoint)
+	err = graph.DeleteChannelEdges(chanID)
 	if err != ErrEdgeNotFound {
 		t.Fatalf("deleting a non-existent edge should fail!")
 	}
@@ -522,28 +528,37 @@ func TestDisconnectBlockAtHeight(t *testing.T) {
 	}
 
 	// The two first edges should be removed from the db.
-	_, _, has, err := graph.HasChannelEdge(edgeInfo.ChannelID)
+	_, _, has, isZombie, err := graph.HasChannelEdge(edgeInfo.ChannelID)
 	if err != nil {
 		t.Fatalf("unable to query for edge: %v", err)
 	}
 	if has {
 		t.Fatalf("edge1 was not pruned from the graph")
 	}
-	_, _, has, err = graph.HasChannelEdge(edgeInfo2.ChannelID)
+	if isZombie {
+		t.Fatal("reorged edge1 should not be marked as zombie")
+	}
+	_, _, has, isZombie, err = graph.HasChannelEdge(edgeInfo2.ChannelID)
 	if err != nil {
 		t.Fatalf("unable to query for edge: %v", err)
 	}
 	if has {
 		t.Fatalf("edge2 was not pruned from the graph")
 	}
+	if isZombie {
+		t.Fatal("reorged edge2 should not be marked as zombie")
+	}
 
 	// Edge 3 should not be removed.
-	_, _, has, err = graph.HasChannelEdge(edgeInfo3.ChannelID)
+	_, _, has, isZombie, err = graph.HasChannelEdge(edgeInfo3.ChannelID)
 	if err != nil {
 		t.Fatalf("unable to query for edge: %v", err)
 	}
 	if !has {
 		t.Fatalf("edge3 was pruned from the graph")
+	}
+	if isZombie {
+		t.Fatal("edge3 was marked as zombie")
 	}
 
 	// PruneTip should be set to the blockHash we specified for the block
@@ -755,11 +770,15 @@ func TestEdgeInfoUpdates(t *testing.T) {
 
 	// Check for existence of the edge within the database, it should be
 	// found.
-	_, _, found, err := graph.HasChannelEdge(chanID)
+	_, _, found, isZombie, err := graph.HasChannelEdge(chanID)
 	if err != nil {
 		t.Fatalf("unable to query for edge: %v", err)
-	} else if !found {
+	}
+	if !found {
 		t.Fatalf("graph should have of inserted edge")
+	}
+	if isZombie {
+		t.Fatal("live edge should not be marked as zombie")
 	}
 
 	// We should also be able to retrieve the channelID only knowing the
@@ -1724,6 +1743,23 @@ func TestFilterKnownChanIDs(t *testing.T) {
 		chanIDs = append(chanIDs, chanID.ToUint64())
 	}
 
+	const numZombies = 5
+	zombieIDs := make([]uint64, 0, numZombies)
+	for i := 0; i < numZombies; i++ {
+		channel, chanID := createEdge(
+			uint32(i*10+1), 0, 0, 0, node1, node2,
+		)
+		if err := graph.AddChannelEdge(&channel); err != nil {
+			t.Fatalf("unable to create channel edge: %v", err)
+		}
+		err := graph.DeleteChannelEdges(channel.ChannelID)
+		if err != nil {
+			t.Fatalf("unable to mark edge zombie: %v", err)
+		}
+
+		zombieIDs = append(zombieIDs, chanID.ToUint64())
+	}
+
 	queryCases := []struct {
 		queryIDs []uint64
 
@@ -1733,6 +1769,11 @@ func TestFilterKnownChanIDs(t *testing.T) {
 		// response should be the empty set.
 		{
 			queryIDs: chanIDs,
+		},
+		// If we attempt to filter out all zombies that we know of, the
+		// response should be the empty set.
+		{
+			queryIDs: zombieIDs,
 		},
 
 		// If we query for a set of ID's that we didn't insert, we
@@ -1965,6 +2006,24 @@ func TestFetchChanInfos(t *testing.T) {
 
 		edgeQuery = append(edgeQuery, chanID.ToUint64())
 	}
+
+	// Add an additional edge that does not exist. The query should skip
+	// this channel and return only infos for the edges that exist.
+	edgeQuery = append(edgeQuery, 500)
+
+	// Add an another edge to the query that has been marked as a zombie
+	// edge. The query should also skip this channel.
+	zombieChan, zombieChanID := createEdge(
+		666, 0, 0, 0, node1, node2,
+	)
+	if err := graph.AddChannelEdge(&zombieChan); err != nil {
+		t.Fatalf("unable to create channel edge: %v", err)
+	}
+	err = graph.DeleteChannelEdges(zombieChan.ChannelID)
+	if err != nil {
+		t.Fatalf("unable to delete and mark edge zombie: %v", err)
+	}
+	edgeQuery = append(edgeQuery, zombieChanID.ToUint64())
 
 	// We'll now attempt to query for the range of channel ID's we just
 	// inserted into the database. We should get the exact same set of
@@ -2577,7 +2636,7 @@ func TestNodeIsPublic(t *testing.T) {
 	// graph. This will make Alice be seen as a private node as it no longer
 	// has any advertised edges.
 	for _, graph := range graphs {
-		err := graph.DeleteChannelEdge(&aliceBobEdge.ChannelPoint)
+		err := graph.DeleteChannelEdges(aliceBobEdge.ChannelID)
 		if err != nil {
 			t.Fatalf("unable to remove edge: %v", err)
 		}
@@ -2594,7 +2653,7 @@ func TestNodeIsPublic(t *testing.T) {
 	// completely remove the edge as it is not possible for her to know of
 	// it without it being advertised.
 	for i, graph := range graphs {
-		err := graph.DeleteChannelEdge(&bobCarolEdge.ChannelPoint)
+		err := graph.DeleteChannelEdges(bobCarolEdge.ChannelID)
 		if err != nil {
 			t.Fatalf("unable to remove edge: %v", err)
 		}
@@ -2617,6 +2676,102 @@ func TestNodeIsPublic(t *testing.T) {
 		[]*ChannelGraph{aliceGraph, carolGraph},
 		false,
 	)
+}
+
+// TestDisabledChannelIDs ensures that the disabled channels within the
+// disabledEdgePolicyBucket are managed properly and the list returned from
+// DisabledChannelIDs is correct.
+func TestDisabledChannelIDs(t *testing.T) {
+	t.Parallel()
+
+	db, cleanUp, err := makeTestDB()
+	if err != nil {
+		t.Fatalf("unable to make test database: %v", err)
+	}
+	defer cleanUp()
+
+	graph := db.ChannelGraph()
+
+	// Create first node and add it to the graph.
+	node1, err := createTestVertex(db)
+	if err != nil {
+		t.Fatalf("unable to create test node: %v", err)
+	}
+	if err := graph.AddLightningNode(node1); err != nil {
+		t.Fatalf("unable to add node: %v", err)
+	}
+
+	// Create second node and add it to the graph.
+	node2, err := createTestVertex(db)
+	if err != nil {
+		t.Fatalf("unable to create test node: %v", err)
+	}
+	if err := graph.AddLightningNode(node2); err != nil {
+		t.Fatalf("unable to add node: %v", err)
+	}
+
+	// Adding a new channel edge to the graph.
+	edgeInfo, edge1, edge2 := createChannelEdge(db, node1, node2)
+	if err := graph.AddLightningNode(node2); err != nil {
+		t.Fatalf("unable to add node: %v", err)
+	}
+
+	if err := graph.AddChannelEdge(edgeInfo); err != nil {
+		t.Fatalf("unable to create channel edge: %v", err)
+	}
+
+	// Ensure no disabled channels exist in the bucket on start.
+	disabledChanIds, err := graph.DisabledChannelIDs()
+	if err != nil {
+		t.Fatalf("unable to get disabled channel ids: %v", err)
+	}
+	if len(disabledChanIds) > 0 {
+		t.Fatalf("expected empty disabled channels, got %v disabled channels",
+			len(disabledChanIds))
+	}
+
+	// Add one disabled policy and ensure the channel is still not in the
+	// disabled list.
+	edge1.ChannelFlags |= lnwire.ChanUpdateDisabled
+	if err := graph.UpdateEdgePolicy(edge1); err != nil {
+		t.Fatalf("unable to update edge: %v", err)
+	}
+	disabledChanIds, err = graph.DisabledChannelIDs()
+	if err != nil {
+		t.Fatalf("unable to get disabled channel ids: %v", err)
+	}
+	if len(disabledChanIds) > 0 {
+		t.Fatalf("expected empty disabled channels, got %v disabled channels",
+			len(disabledChanIds))
+	}
+
+	// Add second disabled policy and ensure the channel is now in the
+	// disabled list.
+	edge2.ChannelFlags |= lnwire.ChanUpdateDisabled
+	if err := graph.UpdateEdgePolicy(edge2); err != nil {
+		t.Fatalf("unable to update edge: %v", err)
+	}
+	disabledChanIds, err = graph.DisabledChannelIDs()
+	if err != nil {
+		t.Fatalf("unable to get disabled channel ids: %v", err)
+	}
+	if len(disabledChanIds) != 1 || disabledChanIds[0] != edgeInfo.ChannelID {
+		t.Fatalf("expected disabled channel with id %v, "+
+			"got %v", edgeInfo.ChannelID, disabledChanIds)
+	}
+
+	// Delete the channel edge and ensure it is removed from the disabled list.
+	if err = graph.DeleteChannelEdges(edgeInfo.ChannelID); err != nil {
+		t.Fatalf("unable to delete channel edge: %v", err)
+	}
+	disabledChanIds, err = graph.DisabledChannelIDs()
+	if err != nil {
+		t.Fatalf("unable to get disabled channel ids: %v", err)
+	}
+	if len(disabledChanIds) > 0 {
+		t.Fatalf("expected empty disabled channels, got %v disabled channels",
+			len(disabledChanIds))
+	}
 }
 
 // TestEdgePolicyMissingMaxHtcl tests that if we find a ChannelEdgePolicy in
@@ -2786,6 +2941,94 @@ func TestEdgePolicyMissingMaxHtcl(t *testing.T) {
 	assertEdgeInfoEqual(t, dbEdgeInfo, edgeInfo)
 }
 
+// assertNumZombies queries the provided ChannelGraph for NumZombies, and
+// asserts that the returned number is equal to expZombies.
+func assertNumZombies(t *testing.T, graph *ChannelGraph, expZombies uint64) {
+	t.Helper()
+
+	numZombies, err := graph.NumZombies()
+	if err != nil {
+		t.Fatalf("unable to query number of zombies: %v", err)
+	}
+
+	if numZombies != expZombies {
+		t.Fatalf("expected %d zombies, found %d",
+			expZombies, numZombies)
+	}
+}
+
+// TestGraphZombieIndex ensures that we can mark edges correctly as zombie/live.
+func TestGraphZombieIndex(t *testing.T) {
+	t.Parallel()
+
+	// We'll start by creating our test graph along with a test edge.
+	db, cleanUp, err := makeTestDB()
+	defer cleanUp()
+	if err != nil {
+		t.Fatalf("unable to create test database: %v", err)
+	}
+	graph := db.ChannelGraph()
+
+	node1, err := createTestVertex(db)
+	if err != nil {
+		t.Fatalf("unable to create test vertex: %v", err)
+	}
+	node2, err := createTestVertex(db)
+	if err != nil {
+		t.Fatalf("unable to create test vertex: %v", err)
+	}
+
+	// Swap the nodes if the second's pubkey is smaller than the first.
+	// Without this, the comparisons at the end will fail probabilistically.
+	if bytes.Compare(node2.PubKeyBytes[:], node1.PubKeyBytes[:]) < 0 {
+		node1, node2 = node2, node1
+	}
+
+	edge, _, _ := createChannelEdge(db, node1, node2)
+	if err := graph.AddChannelEdge(edge); err != nil {
+		t.Fatalf("unable to create channel edge: %v", err)
+	}
+
+	// Since the edge is known the graph and it isn't a zombie, IsZombieEdge
+	// should not report the channel as a zombie.
+	isZombie, _, _ := graph.IsZombieEdge(edge.ChannelID)
+	if isZombie {
+		t.Fatal("expected edge to not be marked as zombie")
+	}
+	assertNumZombies(t, graph, 0)
+
+	// If we delete the edge and mark it as a zombie, then we should expect
+	// to see it within the index.
+	err = graph.DeleteChannelEdges(edge.ChannelID)
+	if err != nil {
+		t.Fatalf("unable to mark edge as zombie: %v", err)
+	}
+	isZombie, pubKey1, pubKey2 := graph.IsZombieEdge(edge.ChannelID)
+	if !isZombie {
+		t.Fatal("expected edge to be marked as zombie")
+	}
+	if pubKey1 != node1.PubKeyBytes {
+		t.Fatalf("expected pubKey1 %x, got %x", node1.PubKeyBytes,
+			pubKey1)
+	}
+	if pubKey2 != node2.PubKeyBytes {
+		t.Fatalf("expected pubKey2 %x, got %x", node2.PubKeyBytes,
+			pubKey2)
+	}
+	assertNumZombies(t, graph, 1)
+
+	// Similarly, if we mark the same edge as live, we should no longer see
+	// it within the index.
+	if err := graph.MarkEdgeLive(edge.ChannelID); err != nil {
+		t.Fatalf("unable to mark edge as live: %v", err)
+	}
+	isZombie, _, _ = graph.IsZombieEdge(edge.ChannelID)
+	if isZombie {
+		t.Fatal("expected edge to not be marked as zombie")
+	}
+	assertNumZombies(t, graph, 0)
+}
+
 // compareNodes is used to compare two LightningNodes while excluding the
 // Features struct, which cannot be compared as the semantics for reserializing
 // the featuresMap have not been defined.
@@ -2878,4 +3121,77 @@ func compareEdgePolicies(a, b *ChannelEdgePolicy) error {
 			"got %#v", a.db, b.db)
 	}
 	return nil
+}
+
+// TestLightningNodeSigVerifcation checks that we can use the LightningNode's
+// pubkey to verify signatures.
+func TestLightningNodeSigVerification(t *testing.T) {
+	t.Parallel()
+
+	// Create some dummy data to sign.
+	var data [32]byte
+	if _, err := prand.Read(data[:]); err != nil {
+		t.Fatalf("unable to read prand: %v", err)
+	}
+
+	// Create private key and sign the data with it.
+	priv, err := btcec.NewPrivateKey(btcec.S256())
+	if err != nil {
+		t.Fatalf("unable to crete priv key: %v", err)
+	}
+
+	sign, err := priv.Sign(data[:])
+	if err != nil {
+		t.Fatalf("unable to sign: %v", err)
+	}
+
+	// Sanity check that the signature checks out.
+	if !sign.Verify(data[:], priv.PubKey()) {
+		t.Fatalf("signature doesn't check out")
+	}
+
+	// Create a LightningNode from the same private key.
+	db, cleanUp, err := makeTestDB()
+	if err != nil {
+		t.Fatalf("unable to make test database: %v", err)
+	}
+	defer cleanUp()
+
+	node, err := createLightningNode(db, priv)
+	if err != nil {
+		t.Fatalf("unable to create node: %v", err)
+	}
+
+	// And finally check that we can verify the same signature from the
+	// pubkey returned from the lightning node.
+	nodePub, err := node.PubKey()
+	if err != nil {
+		t.Fatalf("unable to get pubkey: %v", err)
+	}
+
+	if !sign.Verify(data[:], nodePub) {
+		t.Fatalf("unable to verify sig")
+	}
+}
+
+// TestComputeFee tests fee calculation based on both in- and outgoing amt.
+func TestComputeFee(t *testing.T) {
+	var (
+		policy = ChannelEdgePolicy{
+			FeeBaseMSat:               10000,
+			FeeProportionalMillionths: 30000,
+		}
+		outgoingAmt = lnwire.MilliSatoshi(1000000)
+		expectedFee = lnwire.MilliSatoshi(40000)
+	)
+
+	fee := policy.ComputeFee(outgoingAmt)
+	if fee != expectedFee {
+		t.Fatalf("expected fee %v, got %v", expectedFee, fee)
+	}
+
+	fwdFee := policy.ComputeFeeFromIncoming(outgoingAmt + fee)
+	if fwdFee != expectedFee {
+		t.Fatalf("expected fee %v, but got %v", fee, fwdFee)
+	}
 }

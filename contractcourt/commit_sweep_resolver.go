@@ -2,13 +2,18 @@ package contractcourt
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
 
-	"github.com/lightningnetwork/lnd/input"
-
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/sweep"
+)
+
+const (
+	// commitOutputConfTarget is the default confirmation target we'll use
+	// for sweeps of commit outputs that belong to us.
+	commitOutputConfTarget = 6
 )
 
 // commitSweepResolver is a resolver that will attempt to sweep the commitment
@@ -72,11 +77,11 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 	select {
 	case _, ok := <-confNtfn.Confirmed:
 		if !ok {
-			return nil, fmt.Errorf("quitting")
+			return nil, errResolverShuttingDown
 		}
 
 	case <-c.Quit:
-		return nil, fmt.Errorf("quitting")
+		return nil, errResolverShuttingDown
 	}
 
 	// We're dealing with our commitment transaction if the delay on the
@@ -84,12 +89,23 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 	isLocalCommitTx := c.commitResolution.MaturityDelay != 0
 
 	if !isLocalCommitTx {
+		// There're two types of commitments, those that have tweaks
+		// for the remote key (us in this case), and those that don't.
+		// We'll rely on the presence of the commitment tweak to to
+		// discern which type of commitment this is.
+		var witnessType input.WitnessType
+		if c.commitResolution.SelfOutputSignDesc.SingleTweak == nil {
+			witnessType = input.CommitSpendNoDelayTweakless
+		} else {
+			witnessType = input.CommitmentNoDelay
+		}
+
 		// We'll craft an input with all the information required for
 		// the sweeper to create a fully valid sweeping transaction to
 		// recover these coins.
 		inp := input.MakeBaseInput(
 			&c.commitResolution.SelfOutPoint,
-			input.CommitmentNoDelay,
+			witnessType,
 			&c.commitResolution.SelfOutputSignDesc,
 			c.broadcastHeight,
 		)
@@ -98,7 +114,8 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 		// sweeper.
 		log.Infof("%T(%v): sweeping commit output", c, c.chanPoint)
 
-		resultChan, err := c.Sweeper.SweepInput(&inp)
+		feePref := sweep.FeePreference{ConfTarget: commitOutputConfTarget}
+		resultChan, err := c.Sweeper.SweepInput(&inp, feePref)
 		if err != nil {
 			log.Errorf("%T(%v): unable to sweep input: %v",
 				c, c.chanPoint, err)
@@ -116,13 +133,13 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 				log.Errorf("%T(%v): unable to sweep input: %v",
 					c, c.chanPoint, sweepResult.Err)
 
-				return nil, err
+				return nil, sweepResult.Err
 			}
 
 			log.Infof("ChannelPoint(%v) commit tx is fully resolved by "+
 				"sweep tx: %v", c.chanPoint, sweepResult.Tx.TxHash())
 		case <-c.Quit:
-			return nil, fmt.Errorf("quitting")
+			return nil, errResolverShuttingDown
 		}
 
 		c.resolved = true
@@ -148,7 +165,7 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 	select {
 	case commitSpend, ok := <-spendNtfn.Spend:
 		if !ok {
-			return nil, fmt.Errorf("quitting")
+			return nil, errResolverShuttingDown
 		}
 
 		// Once we detect the commitment output has been spent,
@@ -164,7 +181,7 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 			return nil, err
 		}
 	case <-c.Quit:
-		return nil, fmt.Errorf("quitting")
+		return nil, errResolverShuttingDown
 	}
 
 	log.Infof("%T(%v): waiting for commit sweep txid=%v conf", c, c.chanPoint,
@@ -183,14 +200,14 @@ func (c *commitSweepResolver) Resolve() (ContractResolver, error) {
 	select {
 	case confInfo, ok := <-confNtfn.Confirmed:
 		if !ok {
-			return nil, fmt.Errorf("quitting")
+			return nil, errResolverShuttingDown
 		}
 
 		log.Infof("ChannelPoint(%v) commit tx is fully resolved, at height: %v",
 			c.chanPoint, confInfo.BlockHeight)
 
 	case <-c.Quit:
-		return nil, fmt.Errorf("quitting")
+		return nil, errResolverShuttingDown
 	}
 
 	// Once the transaction has received a sufficient number of
